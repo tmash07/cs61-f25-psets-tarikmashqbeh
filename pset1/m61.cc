@@ -7,7 +7,6 @@
 #include <cassert>
 #include <sys/mman.h>
 
-
 struct m61_memory_buffer {
     char* buffer;
     size_t pos = 0;
@@ -34,7 +33,11 @@ m61_memory_buffer::~m61_memory_buffer() {
     munmap(this->buffer, this->size);
 }
 
-
+static m61_statistics memory_stats = {
+    .nactive = 0, .active_size = 0, .ntotal = 0,
+    .total_size = 0, .nfail = 0, .fail_size = 0,
+    .heap_min = 0, .heap_max = 0
+};
 
 
 /// m61_malloc(sz, file, line)
@@ -45,18 +48,32 @@ m61_memory_buffer::~m61_memory_buffer() {
 
 void* m61_malloc(size_t sz, const char* file, int line) {
     (void) file, (void) line;   // avoid uninitialized variable warnings
-    // Your code here.
-    if (default_buffer.pos + sz > default_buffer.size) {
-        // Not enough space left in default buffer for allocation
-        return nullptr;
+    // Find padding needed for 16-byte alignment
+    size_t aligned_sz = (sz + 15) & ~15;
+    // Check if space is available for padded allocation
+    void* ptr;
+    if (default_buffer.pos + aligned_sz <= default_buffer.size) {
+        // Space is available, allocate memory
+        ptr = &default_buffer.buffer[default_buffer.pos];
+        default_buffer.pos += aligned_sz;
     }
-
-    // Otherwise there is enough space; claim the next `sz` bytes
-    void* ptr = &default_buffer.buffer[default_buffer.pos];
-    default_buffer.pos += sz;
+    else {
+        // Not enough space left in default buffer for allocation
+        ptr = nullptr;
+    }
+    if (ptr) {
+        // Increment total memory and allocation counts
+        memory_stats.total_size += sz;
+        ++memory_stats.ntotal;
+        ++memory_stats.nactive;
+    }
+    else {
+        // Increment failure size/count
+        memory_stats.nfail++;
+        memory_stats.fail_size += sz;
+    }
     return ptr;
 }
-
 
 /// m61_free(ptr, file, line)
 ///    Frees the memory allocation pointed to by `ptr`. If `ptr == nullptr`,
@@ -67,7 +84,9 @@ void* m61_malloc(size_t sz, const char* file, int line) {
 void m61_free(void* ptr, const char* file, int line) {
     // avoid uninitialized variable warnings
     (void) ptr, (void) file, (void) line;
-    // Your code here. The handout code does nothing!
+    if (ptr != nullptr) {
+        --memory_stats.nactive;
+    }
 }
 
 
@@ -92,11 +111,7 @@ void* m61_calloc(size_t count, size_t sz, const char* file, int line) {
 ///    Return the current memory statistics.
 
 m61_statistics m61_get_statistics() {
-    // Your code here.
-    // The handout code sets all statistics to enormous numbers.
-    m61_statistics stats;
-    memset(&stats, 255, sizeof(m61_statistics));
-    return stats;
+    return memory_stats;
 }
 
 
