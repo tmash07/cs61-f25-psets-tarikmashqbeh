@@ -48,11 +48,18 @@ static m61_statistics memory_stats = {
 
 void* m61_malloc(size_t sz, const char* file, int line) {
     (void) file, (void) line;   // avoid uninitialized variable warnings
+    // Guard against overflow when finding aligned_sz
+    if (sz > SIZE_MAX - 15) {
+        memory_stats.nfail++;
+        memory_stats.fail_size += sz;
+        return nullptr;
+    }
     // Find padding needed for 16-byte alignment
     size_t aligned_sz = (sz + 15) & ~15;
-    // Check if space is available for padded allocation
+    // Check if space is available for padded allocation, guarding against
+    // overflow when calculating available space
     void* ptr;
-    if (default_buffer.pos + aligned_sz <= default_buffer.size) {
+    if (aligned_sz <= default_buffer.size - default_buffer.pos) {
         // Space is available, allocate memory
         ptr = &default_buffer.buffer[default_buffer.pos];
         default_buffer.pos += aligned_sz;
@@ -66,6 +73,17 @@ void* m61_malloc(size_t sz, const char* file, int line) {
         memory_stats.total_size += sz;
         ++memory_stats.ntotal;
         ++memory_stats.nactive;
+        
+        auto addr = reinterpret_cast<uintptr_t>(ptr);
+        auto endAddr = addr + aligned_sz;
+        // Adjust heap_min for intial case or new smallest address
+        if (memory_stats.heap_min == 0 || addr < memory_stats.heap_min) {
+            memory_stats.heap_min = addr;
+        }
+        // Adjust heap_max for new largest address
+        if (endAddr > memory_stats.heap_max) {
+            memory_stats.heap_max = endAddr;
+        }
     }
     else {
         // Increment failure size/count
@@ -98,7 +116,12 @@ void m61_free(void* ptr, const char* file, int line) {
 ///    also return `nullptr` if `count == 0` or `size == 0`.
 
 void* m61_calloc(size_t count, size_t sz, const char* file, int line) {
-    // Your code here (not needed for first tests).
+    // Guard against multiplication overflow
+    if (count != 0 && sz > SIZE_MAX / count) {
+        memory_stats.nfail++;
+        memory_stats.fail_size += static_cast<unsigned long long>(count) * static_cast<unsigned long long>(sz);
+        return nullptr;
+    }
     void* ptr = m61_malloc(count * sz, file, line);
     if (ptr) {
         memset(ptr, 0, count * sz);
