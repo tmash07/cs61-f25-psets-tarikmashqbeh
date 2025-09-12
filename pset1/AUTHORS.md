@@ -1,17 +1,18 @@
-Author and collaborators
-========================
+# Author and collaborators
 
-Student
--------
-(Your name.)
+## Student
 
-
-Collaborators
--------------
-(List any other collaborators and describe help you got from other students
-in the class.)
+Tarik Mashqbeh
 
 
-Citations
----------
-(List any other sources consulted.)
+
+## Collaborators
+
+None
+
+
+
+## Citations
+
+None
+
