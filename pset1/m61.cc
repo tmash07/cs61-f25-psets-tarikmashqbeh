@@ -10,6 +10,7 @@
 #include <vector>
 #include <algorithm>
 #include <iostream>
+#include <unordered_set>
 
 struct m61_memory_buffer {
     char* buffer;
@@ -59,9 +60,11 @@ struct activeBlock {
 constexpr size_t guardSize = 16;
 constexpr unsigned char guardExpression = 0xDD;
 
-// Map for storing active allocations, vector for storing freed allocations
+// Map for storing active allocations, vector for storing freed allocations, and vector for
+// storing start addresses of freed pointers that got merged with the tail
 static std::unordered_map<void*, activeBlock> activeAlloc;
 static std::vector<freeBlock> freedAlloc;
+static std::unordered_set<void*> trimmed;
 
 /// align(size_t sz)
 ///     Given a size, rounds up to the next multiple of 16
@@ -190,7 +193,7 @@ void* m61_malloc(size_t sz, const char* file, int line) {
         if (aligned_total <= default_buffer.size - default_buffer.pos) {
             // Space is available, allocate memory
             ptr = &default_buffer.buffer[default_buffer.pos];
-            default_buffer.pos += aligned_total;        
+            default_buffer.pos += aligned_total;
         }
         else {
             // Not enough space left in default buffer for allocation
@@ -200,6 +203,10 @@ void* m61_malloc(size_t sz, const char* file, int line) {
     if (ptr) {
         // Update guard space
         std::memset(reinterpret_cast<unsigned char*>(ptr) + sz, guardExpression, guardSize);
+        // Update set of tail trims
+        if (trimmed.contains(static_cast<char*>(ptr))) {
+            trimmed.erase(static_cast<char*>(ptr));
+        }
         // Handle successful allocation
         success(sz);
         activeAlloc[ptr] = { sz, file, line };
@@ -247,44 +254,45 @@ void m61_free(void* ptr, const char* file, int line) {
     auto it = activeAlloc.find(ptr);
     if (it == activeAlloc.end()) {
         // Handle double frees (ptr was already freed)
-        bool doubleFree = false;
-        auto itFree = std::find_if(freedAlloc.begin(), freedAlloc.end(),
-            [p](const freeBlock& f) 
-            { return p >= f.address && p < f.address + f.sz; });
-        if (itFree != freedAlloc.end()) {
-            doubleFree = true;
-        }
-        // double-free case where freed memory was coalesced with heap
-        char* max = reinterpret_cast<char*>(memory_stats.heap_max);
-        if (p >= default_buffer.buffer + default_buffer.pos && p < max) {
-            doubleFree = true;
-        }
-        if (doubleFree) {
+        if (trimmed.contains(ptr)) {
             std::cerr << "MEMORY BUG: " << file << ":" << line
                 << ": invalid free of pointer " << ptr << ", double free" << std::endl;
-            abort();
         }
         else { // Handle invalid frees (ptr was never allocated)
             std::cerr << "MEMORY BUG: " << file << ":" << line
                 << ": invalid free of pointer " << ptr << ", not allocated" << std::endl;
-            abort();
+            // Handle case where ptr is inside an active block
+            auto insideActive = std::find_if(activeAlloc.begin(), activeAlloc.end(),
+                [p](const auto& pair) {
+                    char* start = static_cast<char*>(pair.first);
+                    return p > start && p < start + pair.second.sz;
+                });
+            char* start = static_cast<char*>(insideActive->first);
+            size_t offset = static_cast<size_t>(p - start);
+            if (insideActive != activeAlloc.end()) {
+                std::cerr << "  " << insideActive->second.file << ":"<< insideActive->second.line 
+                    << ": " << ptr << " is " << offset << " bytes inside a " 
+                    << insideActive->second.sz << " byte region allocated here" << std::endl;
+            }
         }
+        abort();
     }
     // Check trailing guard
+    const size_t activeSz = it->second.sz;
     unsigned char* pUnsigned = reinterpret_cast<unsigned char*>(ptr);
     for (size_t i = 0; i < guardSize; ++i) {
-        if (pUnsigned[activeAlloc[ptr].sz + i] != guardExpression) {
+        if (pUnsigned[activeSz + i] != guardExpression) {
             std::cerr << "MEMORY BUG: " << file << ":" << line
                 << ": detected wild write during free of pointer " << ptr
                 << std::endl;
             abort();
         }
     }
-    
     // Handle successful case
     --memory_stats.nactive;
-    memory_stats.active_size -= activeAlloc[ptr].sz;
-    insertFreedAlloc({ static_cast<char*>(ptr), align(activeAlloc[ptr].sz + guardSize) });
+    memory_stats.active_size -= activeSz;
+    insertFreedAlloc({ p, align(activeSz + guardSize) });
+    trimmed.insert(it->first);
     activeAlloc.erase(it);
 }
 
