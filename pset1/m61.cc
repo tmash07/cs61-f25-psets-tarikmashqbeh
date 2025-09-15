@@ -8,6 +8,8 @@
 #include <sys/mman.h>
 #include <unordered_map>
 #include <vector>
+#include <algorithm>
+#include <iostream>
 
 struct m61_memory_buffer {
     char* buffer;
@@ -46,9 +48,19 @@ struct freeBlock {
     char* address;
     size_t sz;
 };
+// Struct for storing active blocks
+struct activeBlock {
+    size_t sz;
+    const char* file;
+    int line;
+};
+
+// Constant for trailing guard size (in case it needs changed)
+constexpr size_t guardSize = 16;
+constexpr unsigned char guardExpression = 0xDD;
 
 // Map for storing active allocations, vector for storing freed allocations
-static std::unordered_map<void*, size_t> activeAlloc;
+static std::unordered_map<void*, activeBlock> activeAlloc;
 static std::vector<freeBlock> freedAlloc;
 
 /// align(size_t sz)
@@ -166,19 +178,19 @@ void* m61_malloc(size_t sz, const char* file, int line) {
         fail(sz);
         return nullptr;
     }
-    // Find padding needed for 16-byte alignment
-    size_t aligned_sz = align(sz);
-
+    // Find padding needed for 16-byte alignment, then combine with guard
+    size_t total = sz + guardSize;
+    size_t aligned_total = align(total);
     // Try to fit the allocation into previously freed space
-    void* ptr = findFreeSpace(aligned_sz);
+    void* ptr = findFreeSpace(aligned_total);
     // If that fails, try new space
     if (!ptr) {
         // Check if space is available for padded allocation, guarding against
         // overflow when calculating available space
-        if (aligned_sz <= default_buffer.size - default_buffer.pos) {
+        if (aligned_total <= default_buffer.size - default_buffer.pos) {
             // Space is available, allocate memory
             ptr = &default_buffer.buffer[default_buffer.pos];
-            default_buffer.pos += aligned_sz;
+            default_buffer.pos += aligned_total;        
         }
         else {
             // Not enough space left in default buffer for allocation
@@ -186,12 +198,14 @@ void* m61_malloc(size_t sz, const char* file, int line) {
         }
     }
     if (ptr) {
+        // Update guard space
+        std::memset(reinterpret_cast<unsigned char*>(ptr) + sz, guardExpression, guardSize);
         // Handle successful allocation
         success(sz);
-        activeAlloc[ptr] = sz;
+        activeAlloc[ptr] = { sz, file, line };
         
         auto addr = reinterpret_cast<uintptr_t>(ptr);
-        auto endAddr = addr + aligned_sz;
+        auto endAddr = addr + aligned_total;
         // Adjust heap_min for intial case or new smallest address
         if (memory_stats.heap_min == 0 || addr < memory_stats.heap_min) {
             memory_stats.heap_min = addr;
@@ -217,14 +231,62 @@ void* m61_malloc(size_t sz, const char* file, int line) {
 void m61_free(void* ptr, const char* file, int line) {
     // avoid uninitialized variable warnings
     (void) ptr, (void) file, (void) line;
-    if (ptr != nullptr) {
-        --memory_stats.nactive;
-        memory_stats.active_size -= activeAlloc[ptr];
-        insertFreedAlloc({ static_cast<char*>(ptr), align(activeAlloc[ptr]) });
-        activeAlloc.erase(ptr);
+    // Handle nullptr case
+    if (ptr == nullptr) {
+        return;
     }
+    // Handle cases where ptr does not point to an active allocation
+    // Three cases: not in heap, double free, invalid free
+    char* p = reinterpret_cast<char*>(ptr);
+    // Handle not in heap case
+    if (p < default_buffer.buffer || p >= default_buffer.buffer + default_buffer.size) {
+        std::cerr << "MEMORY BUG: " << file << ":" << line
+            << ": invalid free of pointer " << ptr << ", not in heap" << std::endl;
+        abort();
+    }
+    auto it = activeAlloc.find(ptr);
+    if (it == activeAlloc.end()) {
+        // Handle double frees (ptr was already freed)
+        bool doubleFree = false;
+        auto itFree = std::find_if(freedAlloc.begin(), freedAlloc.end(),
+            [p](const freeBlock& f) 
+            { return p >= f.address && p < f.address + f.sz; });
+        if (itFree != freedAlloc.end()) {
+            doubleFree = true;
+        }
+        // double-free case where freed memory was coalesced with heap
+        char* max = reinterpret_cast<char*>(memory_stats.heap_max);
+        if (p >= default_buffer.buffer + default_buffer.pos && p < max) {
+            doubleFree = true;
+        }
+        if (doubleFree) {
+            std::cerr << "MEMORY BUG: " << file << ":" << line
+                << ": invalid free of pointer " << ptr << ", double free" << std::endl;
+            abort();
+        }
+        else { // Handle invalid frees (ptr was never allocated)
+            std::cerr << "MEMORY BUG: " << file << ":" << line
+                << ": invalid free of pointer " << ptr << ", not allocated" << std::endl;
+            abort();
+        }
+    }
+    // Check trailing guard
+    unsigned char* pUnsigned = reinterpret_cast<unsigned char*>(ptr);
+    for (size_t i = 0; i < guardSize; ++i) {
+        if (pUnsigned[activeAlloc[ptr].sz + i] != guardExpression) {
+            std::cerr << "MEMORY BUG: " << file << ":" << line
+                << ": detected wild write during free of pointer " << ptr
+                << std::endl;
+            abort();
+        }
+    }
+    
+    // Handle successful case
+    --memory_stats.nactive;
+    memory_stats.active_size -= activeAlloc[ptr].sz;
+    insertFreedAlloc({ static_cast<char*>(ptr), align(activeAlloc[ptr].sz + guardSize) });
+    activeAlloc.erase(it);
 }
-
 
 /// m61_calloc(count, sz, file, line)
 ///    Returns a pointer a fresh dynamic memory allocation big enough to
@@ -273,5 +335,11 @@ void m61_print_statistics() {
 ///    memory.
 
 void m61_print_leak_report() {
-    // Your code here.
+    for (const auto& pair : activeAlloc) {
+        std::cout << "LEAK CHECK: " << pair.second.file << ":" 
+            << pair.second.line << ": allocated object " << pair.first
+            << " with size " << pair.second.sz << std::endl;
+    }
 }
+
+
