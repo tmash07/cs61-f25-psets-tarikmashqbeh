@@ -6,6 +6,8 @@
 #include <cinttypes>
 #include <cassert>
 #include <sys/mman.h>
+#include <unordered_map>
+#include <vector>
 
 struct m61_memory_buffer {
     char* buffer;
@@ -39,6 +41,117 @@ static m61_statistics memory_stats = {
     .heap_min = 0, .heap_max = 0
 };
 
+// Struct for storing freed blocks
+struct freeBlock {
+    char* address;
+    size_t sz;
+};
+
+// Map for storing active allocations, vector for storing freed allocations
+static std::unordered_map<void*, size_t> activeAlloc;
+static std::vector<freeBlock> freedAlloc;
+
+/// align(size_t sz)
+///     Given a size, rounds up to the next multiple of 16
+size_t align(size_t sz) {
+    return (sz + 15) & ~15;
+}
+
+/// fail(size_t sz)
+///     Updates memory statistics for a failed allocation
+void fail(size_t sz) {
+    memory_stats.nfail++;
+    memory_stats.fail_size += sz;
+}
+
+/// success(size_t sz)
+///     Updates memory statistics for a successful allocation
+void success(size_t sz) {
+    memory_stats.ntotal++;
+    memory_stats.nactive++;
+    memory_stats.active_size += sz;
+    memory_stats.total_size += sz;
+}
+
+/// insertFreedAlloc(freeBlock freed)
+///     Inserts a freed allocation into the freedAlloc vector, keeping
+///     the vector sorted by ptr memory address.
+static void insertFreedAlloc(const freeBlock& freed) {
+    // Variable to store index where freed is inserted
+    size_t i = 0;
+
+    // Handle case where freed is the first freed pointer
+    // or freed has a larger address than all other freed pointers
+    if (freedAlloc.empty()) {
+        freedAlloc.push_back(freed);
+    } else if (freedAlloc[freedAlloc.size() - 1].address < freed.address) {
+        freedAlloc.push_back(freed);
+        i = freedAlloc.size() - 1;
+    } else {
+        // Insert the freed block before the first pointer that has a larger address
+        for (size_t j = 0; j < freedAlloc.size(); ++j) {
+            if (freedAlloc[j].address > freed.address) {
+                freedAlloc.insert(freedAlloc.begin() + j, freed);
+                i = j;
+                break;
+            }
+        }
+    }
+    // Coalesce with next freed block (if possible)
+    if (i < freedAlloc.size() - 1 && freedAlloc[i].address + freedAlloc[i].sz == freedAlloc[i + 1].address) {
+        freedAlloc[i].sz += freedAlloc[i + 1].sz;
+        freedAlloc.erase(freedAlloc.begin() + i + 1);
+    }
+    // Coalesce with previous freed block (if possible)
+    if (i > 0 && freedAlloc[i - 1].address + freedAlloc[i - 1].sz == freedAlloc[i].address) {
+        freedAlloc[i - 1].sz += freedAlloc[i].sz;
+        freedAlloc.erase(freedAlloc.begin() + i);
+    }
+    // Coalesce with default buffer (if possible)
+    char* heap_end = default_buffer.buffer + default_buffer.pos;
+    freeBlock& last = freedAlloc.back();
+
+    if (last.address + last.sz == heap_end) {
+        default_buffer.pos -= last.sz;
+        freedAlloc.pop_back();
+    }
+
+}
+
+/// findFreeSpace(size_t sz)
+///     Finds smallest free space in the vector of freedAlloc that is large
+///     enough to accomodate sz
+static void* findFreeSpace(size_t sz) {
+    // Handle case of empty freedAlloc
+    if (freedAlloc.size() == 0) {
+        return nullptr;
+    }
+    // Find the smallest free space that is large enough for sz
+    size_t bestIndex = (size_t)-1;
+    size_t bestSz = (size_t)-1;
+    for (size_t i = 0; i < freedAlloc.size(); ++i) {
+        if (freedAlloc[i].sz >= sz && freedAlloc[i].sz < bestSz) {
+            bestSz = freedAlloc[i].sz;
+            bestIndex = i;
+            // If perfect fit is found
+            if (bestSz == sz) break;
+        }
+    }
+    // Handle case where no sufficient space was found
+    if (bestSz == (size_t)-1) {
+        return nullptr;
+    }
+    void* ptr = freedAlloc[bestIndex].address;
+    // Handle case where perfect match was found
+    if (bestSz == sz) {
+        freedAlloc.erase(freedAlloc.begin() + bestIndex);
+    }
+    else {
+        freedAlloc[bestIndex].address += sz;
+        freedAlloc[bestIndex].sz -= sz;
+    }
+    return ptr;
+}
 
 /// m61_malloc(sz, file, line)
 ///    Returns a pointer to `sz` bytes of freshly-allocated dynamic memory.
@@ -50,29 +163,32 @@ void* m61_malloc(size_t sz, const char* file, int line) {
     (void) file, (void) line;   // avoid uninitialized variable warnings
     // Guard against overflow when finding aligned_sz
     if (sz > SIZE_MAX - 15) {
-        memory_stats.nfail++;
-        memory_stats.fail_size += sz;
+        fail(sz);
         return nullptr;
     }
     // Find padding needed for 16-byte alignment
-    size_t aligned_sz = (sz + 15) & ~15;
-    // Check if space is available for padded allocation, guarding against
-    // overflow when calculating available space
-    void* ptr;
-    if (aligned_sz <= default_buffer.size - default_buffer.pos) {
-        // Space is available, allocate memory
-        ptr = &default_buffer.buffer[default_buffer.pos];
-        default_buffer.pos += aligned_sz;
-    }
-    else {
-        // Not enough space left in default buffer for allocation
-        ptr = nullptr;
+    size_t aligned_sz = align(sz);
+
+    // Try to fit the allocation into previously freed space
+    void* ptr = findFreeSpace(aligned_sz);
+    // If that fails, try new space
+    if (!ptr) {
+        // Check if space is available for padded allocation, guarding against
+        // overflow when calculating available space
+        if (aligned_sz <= default_buffer.size - default_buffer.pos) {
+            // Space is available, allocate memory
+            ptr = &default_buffer.buffer[default_buffer.pos];
+            default_buffer.pos += aligned_sz;
+        }
+        else {
+            // Not enough space left in default buffer for allocation
+            ptr = nullptr;
+        }
     }
     if (ptr) {
-        // Increment total memory and allocation counts
-        memory_stats.total_size += sz;
-        ++memory_stats.ntotal;
-        ++memory_stats.nactive;
+        // Handle successful allocation
+        success(sz);
+        activeAlloc[ptr] = sz;
         
         auto addr = reinterpret_cast<uintptr_t>(ptr);
         auto endAddr = addr + aligned_sz;
@@ -86,9 +202,8 @@ void* m61_malloc(size_t sz, const char* file, int line) {
         }
     }
     else {
-        // Increment failure size/count
-        memory_stats.nfail++;
-        memory_stats.fail_size += sz;
+        // Handle failed allocation
+        fail(sz);
     }
     return ptr;
 }
@@ -104,6 +219,9 @@ void m61_free(void* ptr, const char* file, int line) {
     (void) ptr, (void) file, (void) line;
     if (ptr != nullptr) {
         --memory_stats.nactive;
+        memory_stats.active_size -= activeAlloc[ptr];
+        insertFreedAlloc({ static_cast<char*>(ptr), align(activeAlloc[ptr]) });
+        activeAlloc.erase(ptr);
     }
 }
 

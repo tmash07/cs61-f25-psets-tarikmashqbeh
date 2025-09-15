@@ -29,6 +29,9 @@
 .svn
 .cs61tmpid
 .vscode
+# Ignore Visual Studio workspace files (Custom added)
+.vs/
+
 a.out
 cmake-build-*
 config.mk
@@ -45,3 +48,4 @@ tags
 tags.*
 typescript
 vgcore*
+

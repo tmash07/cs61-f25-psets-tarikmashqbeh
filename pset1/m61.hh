@@ -7,6 +7,17 @@
 #include <new>
 #include <random>
 
+/// align(size_t sz)
+///     Rounds up a memory size to the next multiple of 16
+size_t align(size_t sz);
+
+/// fail(size_t sz)
+///     Updates memory statistics for a failed allocation
+void fail(size_t sz);
+
+/// success(size_t sz)
+///     Updates memory statistics for a successful allocation
+void success(size_t sz);
 
 /// m61_malloc(sz, file, line)
 ///    Return a pointer to `sz` bytes of newly-allocated dynamic memory.
