@@ -29,7 +29,7 @@
 .svn
 .cs61tmpid
 .vscode
-# Ignore Visual Studio workspace files (Custom added)
+# Ignore VS files (Custom added)
 .vs/
 
 a.out
