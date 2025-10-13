@@ -62,16 +62,25 @@ void kernel_start(const char* command) {
 
     // (re-)initialize kernel page table
     for (uintptr_t addr = 0; addr < MEMSIZE_PHYSICAL; addr += PAGESIZE) {
-        int perm = PTE_P | PTE_W | PTE_U;
+        int perm;
         if (addr == 0) {
             // nullptr is inaccessible even to the kernel
             perm = 0;
+        }
+        else if (addr == CONSOLE_ADDR) {
+            // CGA console page is accessible to user
+            perm = PTE_P | PTE_W | PTE_U;
+        }
+        else {
+            // Otherwise, kernel only
+            perm = PTE_P | PTE_W;
         }
         // install identity mapping
         int r = vmiter(kernel_pagetable, addr).try_map(addr, perm);
         assert(r == 0); // mappings during kernel_start MUST NOT fail
                         // (Note that later mappings might fail!!)
     }
+
 
     // set up process descriptors
     for (pid_t i = 0; i < MAXNPROC; i++) {
