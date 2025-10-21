@@ -3,8 +3,8 @@
   "WorkspaceRootPath": "C:\\Users\\tmash\\OneDrive\\Desktop\\cs61-f25-psets-tarikmashqbeh\\",
   "Documents": [
     {
-      "AbsoluteMoniker": "D:0:0:{A2FE74E1-B743-11D0-AE1A-00A0C90FFFC3}|\u003CMiscFiles\u003E|C:\\Users\\tmash\\OneDrive\\Desktop\\cs61-f25-psets-tarikmashqbeh\\pset1\\m61.cc||{D0E1A5C6-B359-4E41-9B60-3365922C2A22}",
-      "RelativeMoniker": "D:0:0:{A2FE74E1-B743-11D0-AE1A-00A0C90FFFC3}|\u003CMiscFiles\u003E|solutionrelative:pset1\\m61.cc||{D0E1A5C6-B359-4E41-9B60-3365922C2A22}"
+      "AbsoluteMoniker": "D:0:0:{A2FE74E1-B743-11D0-AE1A-00A0C90FFFC3}|\u003CMiscFiles\u003E|C:\\Users\\tmash\\OneDrive\\Desktop\\cs61-f25-psets-tarikmashqbeh\\pset3\\kernel.cc||{D0E1A5C6-B359-4E41-9B60-3365922C2A22}",
+      "RelativeMoniker": "D:0:0:{A2FE74E1-B743-11D0-AE1A-00A0C90FFFC3}|\u003CMiscFiles\u003E|solutionrelative:pset3\\kernel.cc||{D0E1A5C6-B359-4E41-9B60-3365922C2A22}"
     }
   ],
   "DocumentGroupContainers": [
@@ -23,14 +23,14 @@
             {
               "$type": "Document",
               "DocumentIndex": 0,
-              "Title": "m61.cc",
-              "DocumentMoniker": "C:\\Users\\tmash\\OneDrive\\Desktop\\cs61-f25-psets-tarikmashqbeh\\pset1\\m61.cc",
-              "RelativeDocumentMoniker": "pset1\\m61.cc",
-              "ToolTip": "C:\\Users\\tmash\\OneDrive\\Desktop\\cs61-f25-psets-tarikmashqbeh\\pset1\\m61.cc",
-              "RelativeToolTip": "pset1\\m61.cc",
-              "ViewState": "AgIAACQAAAAAAAAAAAAAADwAAAAOAAAAAAAAAA==",
+              "Title": "kernel.cc",
+              "DocumentMoniker": "C:\\Users\\tmash\\OneDrive\\Desktop\\cs61-f25-psets-tarikmashqbeh\\pset3\\kernel.cc",
+              "RelativeDocumentMoniker": "pset3\\kernel.cc",
+              "ToolTip": "C:\\Users\\tmash\\OneDrive\\Desktop\\cs61-f25-psets-tarikmashqbeh\\pset3\\kernel.cc",
+              "RelativeToolTip": "pset3\\kernel.cc",
+              "ViewState": "AgIAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA==",
               "Icon": "ae27a6b0-e345-4288-96df-5eaf394ee369.000677|",
-              "WhenOpened": "2025-09-09T05:50:44.596Z",
+              "WhenOpened": "2025-10-13T23:34:05.576Z",
               "EditorCaption": ""
             }
           ]

@@ -62,7 +62,7 @@ void kernel_start(const char* command) {
 
     // (re-)initialize kernel page table
     for (uintptr_t addr = 0; addr < MEMSIZE_PHYSICAL; addr += PAGESIZE) {
-        int perm;
+        int perm = PTE_P | PTE_W; // Default to kernel only access
         if (addr == 0) {
             // nullptr is inaccessible even to the kernel
             perm = 0;
@@ -71,9 +71,9 @@ void kernel_start(const char* command) {
             // CGA console page is accessible to user
             perm = PTE_P | PTE_W | PTE_U;
         }
-        else {
-            // Otherwise, kernel only
-            perm = PTE_P | PTE_W;
+        else if (addr >= PROC_START_ADDR) {
+            // User region is accessible to user
+            perm = PTE_P | PTE_W | PTE_U;
         }
         // install identity mapping
         int r = vmiter(kernel_pagetable, addr).try_map(addr, perm);
@@ -162,8 +162,28 @@ void* kalloc(size_t sz) {
 //    If `kptr == nullptr` does nothing.
 
 void kfree(void* kptr) {
-    (void) kptr;
-    assert(false /* your code here */);
+    // Handle nullptr case
+    if(kptr == nullptr) {
+        return;
+    }
+
+    // Convert void* to physical address
+    uintptr_t pa = reinterpret_cast<uintptr_t>(kptr);
+    // Check if physical address is valid, throw error if not
+    if(pa >= MEMSIZE_PHYSICAL || pa % PAGESIZE != 0) {
+        return;
+    }
+
+    int pageno = pa / PAGESIZE;
+    // Guard against double frees
+    if (physpages[pageno].refcount == 0) {
+        return; 
+    }
+
+    // Decrement reference count for the physical page
+    if(physpages[pageno].refcount > 0) {
+        --physpages[pageno].refcount;
+    }
 }
 
 
@@ -173,50 +193,82 @@ void kfree(void* kptr) {
 //    %rip and %rsp, gives it a stack page, and marks it as runnable.
 
 void process_setup(pid_t pid, const char* program_name) {
-    init_process(&ptable[pid], 0);
+    proc* p = &ptable[pid];
+    init_process(p, 0);
 
     // initialize process page table
-    ptable[pid].pagetable = kernel_pagetable;
+    p->pagetable = kalloc_pagetable();
+    assert(p->pagetable != nullptr);
 
-    // obtain reference to program image
-    // (The program image models the process executable.)
+    // Copy kernel region mappings
+    for (vmiter kit(kernel_pagetable, 0); kit.va() < PROC_START_ADDR; kit.next()) {
+        if (!kit.present()) {
+            continue;
+        }
+        // Store virtual address, physical address, and mappings
+        uintptr_t kva = kit.va();
+        uintptr_t kpa = kit.pa();
+        int kperm = kit.perm();
+
+        // If not the console address, get rid of user permission
+        if (kva != CONSOLE_ADDR) {
+            kperm &= ~PTE_U;
+        }
+
+        // Copy values into the new table
+        vmiter pit(p->pagetable, kva);
+        pit.map(kpa, kperm);
+    }
+
     program_image pgm(program_name);
 
-    // allocate and map process memory as specified in program image
+    // Iterate over each segment
     for (auto seg = pgm.begin(); seg != pgm.end(); ++seg) {
-        for (uintptr_t a = round_down(seg.va(), PAGESIZE);
-             a < seg.va() + seg.size();
-             a += PAGESIZE) {
-            // `a` is the process virtual address for the next code/data page
-            // (The handout code requires that the corresponding physical
-            // address is currently free.)
-            assert(physpages[a / PAGESIZE].refcount == 0);
-            ++physpages[a / PAGESIZE].refcount;
-        }
+        // Align with page size to ensure we are covering whole pages
+        uintptr_t seg_lo = round_down(seg.va(), PAGESIZE);
+        uintptr_t seg_hi = round_up(seg.va() + seg.size(), PAGESIZE);
+
+        // Calculate permissions for this segment
+        int uperm = PTE_P | PTE_U | (seg.writable() ? PTE_W : 0);
+
+        // Iterate over each virtual address
+        for (uintptr_t va = seg_lo; va < seg_hi; va += PAGESIZE) {
+            // Allocate a page and zero it
+            void* kpage = kalloc(PAGESIZE);
+            assert(kpage != nullptr);
+            memset(kpage, 0, PAGESIZE);
+
+            // Map the page to this virtual address
+            vmiter pit(p->pagetable, va);
+            pit.map(kpage, uperm);
+
+            // Find section that actually contains segment data
+            uintptr_t copy_lo = va < seg.va() ? seg.va() : va;
+            uintptr_t copy_hi = (va + PAGESIZE) < (seg.va() + seg.data_size()) ? (va + PAGESIZE) : (seg.va() + seg.data_size());
+            // Copy initialized bytes into the process's page
+            if (copy_hi > copy_lo) {
+                char* dst = reinterpret_cast<char*>(kpage) + (copy_lo - va);
+                assert(dst != nullptr);
+                const char* src = seg.data() + (copy_lo - seg.va());
+                memcpy(dst, src, copy_hi - copy_lo);
+            }
+        } 
+    }
+    // Allocate & map one user stack page at the same virtual address
+    uintptr_t stack_addr = MEMSIZE_VIRTUAL - PAGESIZE;
+    {
+        void* kpage = kalloc(PAGESIZE);
+        assert(kpage != nullptr);
+        memset(kpage, 0, PAGESIZE);
+        vmiter pit(p->pagetable, stack_addr);
+        pit.map(kpage, PTE_P | PTE_W | PTE_U);
+        p->regs.reg_rsp = stack_addr + PAGESIZE;
     }
 
-    // copy instructions and data from program image into process memory
-    for (auto seg = pgm.begin(); seg != pgm.end(); ++seg) {
-        memset(reinterpret_cast<void*>(seg.va()), 0, seg.size());
-        memcpy(reinterpret_cast<void*>(seg.va()), seg.data(), seg.data_size());
-    }
-
-    // mark entry point
-    ptable[pid].regs.reg_rip = pgm.entry();
-
-    // allocate and map stack segment
-    // Compute process virtual address for stack page
-    uintptr_t stack_addr = PROC_START_ADDR + PROC_SIZE * pid - PAGESIZE;
-    // The handout code requires that the corresponding physical address
-    // is currently free.
-    assert(physpages[stack_addr / PAGESIZE].refcount == 0);
-    ++physpages[stack_addr / PAGESIZE].refcount;
-    ptable[pid].regs.reg_rsp = stack_addr + PAGESIZE;
-
-    // mark process as runnable
-    ptable[pid].state = P_RUNNABLE;
+    // Set entry point and mark runnable
+    p->regs.reg_rip = pgm.entry();
+    p->state = P_RUNNABLE;
 }
-
 
 
 // exception(regs)
@@ -296,6 +348,8 @@ void exception(regstate* regs) {
 
 
 int syscall_page_alloc(uintptr_t addr);
+int syscall_fork();
+void sys_exit();
 
 
 // syscall(regs)
@@ -348,6 +402,13 @@ uintptr_t syscall(regstate* regs) {
 
     case SYSCALL_PAGE_ALLOC:
         return syscall_page_alloc(current->regs.reg_rdi);
+    
+    case SYSCALL_FORK:
+        return syscall_fork();
+
+    case SYSCALL_EXIT:
+        sys_exit();
+        break;
 
     default:
         proc_panic(current, "Unhandled system call %ld (pid=%d, rip=%p)!\n",
@@ -365,12 +426,180 @@ uintptr_t syscall(regstate* regs) {
 //    in `u-lib.hh` (but in the handout code, it does not).
 
 int syscall_page_alloc(uintptr_t addr) {
-    assert(physpages[addr / PAGESIZE].refcount == 0);
-    ++physpages[addr / PAGESIZE].refcount;
-    memset(reinterpret_cast<void*>(addr), 0, PAGESIZE);
+    // Check that address is in user region and properly aligned
+    if (addr < PROC_START_ADDR || addr >= MEMSIZE_VIRTUAL || addr % PAGESIZE != 0) {
+        // Return with an error
+        return -1;
+    }
+
+    vmiter it(current->pagetable, addr);
+
+    // Allocate a physical page
+    void* kpage = kalloc(PAGESIZE);
+    if (kpage == nullptr) {
+        return -1;
+    }
+    memset(kpage, 0, PAGESIZE);
+
+    // If there was an old mapping, free it and unmap
+    if (it.present() && it.user() && it.va() != CONSOLE_ADDR) {
+        kfree(it.kptr<void*>());       
+        it.map(it.pa(), 0);            
+    }
+
+    // Install new mapping
+    int r = it.try_map(kpage, PTE_P | PTE_W | PTE_U);
+    if (r != 0) {
+        // If mapping fails, free the page
+        kfree(kpage);
+        return -1;
+    }
     return 0;
 }
+/// Helper function for handling page frees
+static void free_pagetable_and_pages(proc* free_proc) {
+    // Unmap & free all user pages
+    for (vmiter it(free_proc->pagetable, PROC_START_ADDR); !it.done(); it.next()) {
+        if (it.present() && it.user() && it.va() != CONSOLE_ADDR) {
+            kfree(it.kptr<void*>());
+            it.map(it.pa(), 0);
+        }
+    }
+    // Free page table pages
+    for (ptiter pt(free_proc->pagetable); !pt.done(); pt.next()) {
+        kfree(pt.kptr());
+    }
+    kfree(free_proc->pagetable);
+    free_proc->pagetable = nullptr;
+    free_proc->state = P_FREE;
+}
 
+int syscall_fork() {
+    // Find a free slot
+    pid_t free_pid = 0;
+    for(pid_t i {1}; i < MAXNPROC; ++i) {
+        if(ptable[i].state == P_FREE) {
+            free_pid = i;
+            break;
+        }
+    }
+    // If no free slot found, return error
+    if(free_pid == 0) {
+        return -1;
+    }
+
+    proc* free_proc = &ptable[free_pid];
+    proc* current_proc = current;
+
+    // Initialize the new process
+    init_process(free_proc, 0);
+
+    // Allocate a new page table for the new process
+    free_proc->pagetable = kalloc_pagetable();
+    // If allocation fails, return error
+    if(free_proc->pagetable == nullptr) {
+        return -1;
+    }
+
+    // Copy kernel region mappings (same as in process_setup)
+    for (vmiter kit(kernel_pagetable, 0); kit.va() < PROC_START_ADDR; kit.next()) {
+        if (!kit.present()) {
+            continue;
+        }
+        
+        uintptr_t kva = kit.va();
+        uintptr_t kpa = kit.pa();
+        int kperm = kit.perm();
+        
+        if (kva != CONSOLE_ADDR) {
+            kperm &= ~PTE_U;
+        }
+        
+        vmiter cit(free_proc->pagetable, kva);
+        int r = cit.try_map(kpa, kperm);
+        if (r != 0) {
+            free_pagetable_and_pages(free_proc);
+            return -1;
+        }
+    }
+    
+    // Copy user region mappings (need separate physical pages)
+    for (vmiter pit(current_proc->pagetable, PROC_START_ADDR); !pit.done(); pit.next()) {
+        if (!pit.present() || !pit.user()) {
+            continue;
+        }
+        
+        uintptr_t va = pit.va();
+        uintptr_t pa = pit.pa();
+        int perm = pit.perm();
+
+        // Copy page if in user region, writable, and not the console
+        if (va >= PROC_START_ADDR && (perm & PTE_U) && pit.writable() && va != CONSOLE_ADDR) {
+            // Allocate new physical page for child
+            void* new_page = kalloc(PAGESIZE);
+            // If allocation fails, clean up and return error
+            if (new_page == nullptr) {
+                free_pagetable_and_pages(free_proc);
+                return -1;
+            }
+                        
+            // Copy data from parent to child
+            memcpy(new_page, reinterpret_cast<void*>(pa), PAGESIZE);
+            
+            // Map new page in child's page table
+            vmiter cit(free_proc->pagetable, va);
+            int r = cit.try_map(new_page, perm);
+            if (r != 0) {
+                free_pagetable_and_pages(free_proc);
+                return -1;
+            }
+        } else {
+            // Share read-only/kernel pages
+            vmiter cit(free_proc->pagetable, va);
+            int r = cit.try_map(pa, perm);
+            if (r != 0) {
+                // Cleanup and return error
+                free_pagetable_and_pages(free_proc);
+                return -1;
+            }
+            // Bump the refcount
+            ++physpages[pa / PAGESIZE].refcount;
+        }
+    }
+    
+    // Copy current register's to forked process
+    free_proc->regs = current_proc->regs;
+    free_proc->regs.reg_rax = 0;
+    free_proc->state = P_RUNNABLE;
+    
+    return free_pid;
+}
+
+void sys_exit() {
+    proc* p = current;
+
+    // Free all user pages
+    for (vmiter it(p->pagetable, PROC_START_ADDR); !it.done(); it.next()) {
+        if (it.present() && it.user() && it.va() != CONSOLE_ADDR) {
+            // free physical page
+            kfree(it.kptr<void*>());
+            // unmap the virtual addresses
+            it.map(it.pa(), 0);
+        }
+    }
+    // Free all page tables
+    for (ptiter pt(p->pagetable); !pt.done(); pt.next()) {
+        kfree(pt.kptr());   
+    }
+    kfree(p->pagetable);     
+    
+    // Mark process as free
+    p->state = P_FREE;
+    p->pagetable = nullptr;
+    
+    // Schedule another process
+    schedule();
+}
 
 // schedule
 //    Pick the next process to run and then run it.

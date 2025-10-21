@@ -14,8 +14,12 @@
       "DocumentGroups": [
         {
           "DockedWidth": 196,
-          "SelectedChildIndex": 0,
+          "SelectedChildIndex": 1,
           "Children": [
+            {
+              "$type": "Bookmark",
+              "Name": "ST:0:0:{1c4feeaa-4718-4aa9-859d-94ce25d182ba}"
+            },
             {
               "$type": "Document",
               "DocumentIndex": 0,
@@ -24,7 +28,7 @@
               "RelativeDocumentMoniker": "pset1\\m61.cc",
               "ToolTip": "C:\\Users\\tmash\\OneDrive\\Desktop\\cs61-f25-psets-tarikmashqbeh\\pset1\\m61.cc",
               "RelativeToolTip": "pset1\\m61.cc",
-              "ViewState": "AgIAAAAAAAAAAAAAAAAAAAcAAAAVAAAAAAAAAA==",
+              "ViewState": "AgIAACQAAAAAAAAAAAAAADwAAAAOAAAAAAAAAA==",
               "Icon": "ae27a6b0-e345-4288-96df-5eaf394ee369.000677|",
               "WhenOpened": "2025-09-09T05:50:44.596Z",
               "EditorCaption": ""
