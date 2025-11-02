@@ -71,20 +71,45 @@ int io61_readc(io61_file* f) {
 //    This is called a “short read.”
 
 ssize_t io61_read(io61_file* f, unsigned char* buf, size_t sz) {
-    size_t nread = 0;
-    while (nread != sz) {
-        int ch = io61_readc(f);
-        if (ch == EOF) {
-            break;
+    // Handle case where no read is required
+    if (sz == 0) {
+        return 0;
+    }
+
+    size_t total = 0;
+    while (total < sz) {
+        // Calculate and attempt to read the remaining bytes wanted
+        size_t want = sz - total;
+        ssize_t n = read(f->fd, buf + total, want);
+        if (n > 0) { // If successful
+            total += (size_t)n;
+            continue; // continue reading until sz is reached
         }
-        buf[nread] = ch;
-        ++nread;
+        else if (n == 0) { // If partial read
+            if (total == 0) { // End of file
+                errno = 0;           
+                return 0;
+            }
+            else { // Short read
+                return static_cast<ssize_t>(total);
+            }
+        }
+        else { // Error
+            if (errno == EINTR || errno == EAGAIN) {
+                continue; // if error is recoverable, retry read
+            }
+            if (total > 0) {
+                return (ssize_t)total; // short read, cannot recover
+            }
+            else {
+                return -1; // cannot recover
+            }
+        }
     }
-    if (nread == 0 && sz != 0 && errno != 0) {
-        return -1;
-    }
-    return nread;
+    // Return number of bytes successfully read
+    return (ssize_t)total; 
 }
+
 
 
 // io61_writec(f)
@@ -110,18 +135,37 @@ int io61_writec(io61_file* f, int c) {
 //    before the error occurred.
 
 ssize_t io61_write(io61_file* f, const unsigned char* buf, size_t sz) {
-    size_t nwritten = 0;
-    while (nwritten != sz) {
-        if (io61_writec(f, buf[nwritten]) == -1) {
-            break;
+    // Handle case where no write is required
+    if (sz == 0) {
+        return 0;
+    }
+
+    size_t total = 0;
+    while (total < sz) {
+        // Calculate and attempt to write remaining bytes wanted
+        size_t want = sz - total;
+        ssize_t n = write(f->fd, buf + total, want);
+        if (n > 0) { // If success
+            total += (size_t)n; 
+            continue; // Continue writing
         }
-        ++nwritten;
+        else {
+            // n == -1 => error
+            if (n == 0 || errno == EINTR || errno == EAGAIN) {
+                continue; // If error is recoverable, try again
+            }
+            if (total > 0) {
+                return (ssize_t)total; // short read, cannot recover
+            }
+            else {
+                return -1; // cannot recover
+            }
+        }
     }
-    if (nwritten == 0 && sz != 0) {
-        return -1;
-    }
-    return nwritten;
+    // return number of bytes successfully written
+    return (ssize_t)total;
 }
+
 
 
 // io61_flush(f)
