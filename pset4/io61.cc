@@ -11,22 +11,23 @@
 //    Data structure for io61 file wrappers. Add your own stuff.
 
 struct io61_file {
-    int fd = -1;     // file descriptor
-    int mode;        // open mode (O_RDONLY or O_WRONLY)
+    int fd = -1; // File descriptor
+    int mode;
 
-    // `bufsiz` is the cache block size
+    // Size of the cache block
     static constexpr off_t bufsize = 4096;
-    // Cached data is stored in `cbuf`
-    unsigned char cbuf[bufsize];
 
+    unsigned char cbuf[bufsize]; // Read buffer 
     // The following “tags” are addresses—file offsets—that describe the cache’s contents.
     // `tag`: File offset of first byte of cached data (0 when file is opened).
-    off_t tag;
     // `end_tag`: File offset one past the last byte of cached data (0 when file is opened).
-    off_t end_tag;
-    // `pos_tag`: Cache position: file offset of the cache.
-    // In read caches, this is the file offset of the next character to be read.
-    off_t pos_tag;
+    // `pos_tag`: Cache position: file offset of the cache. In read caches, this is the file offset of the next character to be read.
+    off_t tag, end_tag, pos_tag; // These are read tags
+
+    unsigned char wbuf[bufsize]; // Write buffer
+    size_t wcount = 0; // Number of valid byte sin wbuf
+    off_t wtag = 0; // File offset of first byte in wbuf
+    bool write_active = false; // Desnotes if wbuf currently holds data
 };
 
 ssize_t io61_fill(io61_file* f) {
@@ -63,6 +64,34 @@ ssize_t io61_fill(io61_file* f) {
     }
 }
 
+static int flush_write_cache(io61_file* f) {
+    if (!f->write_active || f->wcount == 0) {
+        return 0;
+    }
+
+    size_t done = 0;
+    while (done < f->wcount) {
+        ssize_t n = write(f->fd, f->wbuf + done, f->wcount - done);
+        if (n > 0) {
+            done += (size_t)n;
+        }
+        else if (n == 0 || errno == EINTR || errno == EAGAIN) { 
+            continue;
+        }
+        else {
+            if (n == 0 || errno == EINTR || errno == EAGAIN) {
+                continue;        
+            }
+            f->wcount -= done;  
+            return -1;
+        }
+    }
+
+    f->wtag += (off_t)done;
+    f->wcount = 0;
+    return 0;
+}
+
 // io61_fdopen(fd, mode)
 //    Returns a new io61_file for file descriptor `fd`. `mode` is either
 //    O_RDONLY for a read-only file or O_WRONLY for a write-only file.
@@ -77,8 +106,6 @@ io61_file* io61_fdopen(int fd, int mode) {
     return f;
 }
 
-
-
 // io61_close(f)
 //    Closes the io61_file `f` and releases all its resources.
 
@@ -89,7 +116,6 @@ int io61_close(io61_file* f) {
     return r;
 }
 
-
 // io61_readc(f)
 //    Reads a single (unsigned) byte from `f` and returns it. Returns EOF,
 //    which equals -1, on end of file or error.
@@ -99,8 +125,8 @@ int io61_readc(io61_file* f) {
         ssize_t fr = io61_fill(f);
         if (fr == 0) { // End of file
             return -1;
-        }
-        else if (fr < 0) {    // hard error
+        } 
+        else if (fr < 0) { // Cannot recover from error
             return -1;
         }
     }
@@ -157,15 +183,24 @@ ssize_t io61_read(io61_file* f, unsigned char* buf, size_t sz) {
 //    Returns 0 on success and -1 on error.
 
 int io61_writec(io61_file* f, int c) {
-    unsigned char ch = c;
-    ssize_t nw = write(f->fd, &ch, 1);
-    if (nw != 1) {
-        assert(nw == 0 || nw == -1);
+    unsigned char ch = static_cast<unsigned char>(c);
+
+    // Enter writing mode
+    if (!f->write_active) {
+        off_t cur = lseek(f->fd, 0, SEEK_CUR);
+        if (cur != -1) {
+            f->wtag = cur;
+        }
+        f->write_active = true;
+    }
+    // Ensure there is room in the buffer
+    if (f->wcount == static_cast<size_t>(io61_file::bufsize) && flush_write_cache(f) < 0) {
         return -1;
     }
+    // Append the byte to the write cache
+    f->wbuf[f->wcount++] = ch;
     return 0;
 }
-
 
 // io61_write(f, buf, sz)
 //    Writes `sz` characters from `buf` to `f`. Returns `sz` on success.
@@ -181,30 +216,39 @@ ssize_t io61_write(io61_file* f, const unsigned char* buf, size_t sz) {
     }
 
     size_t total = 0;
-    while (total < sz) {
-        // Calculate and attempt to write remaining bytes wanted
-        size_t want = sz - total;
-        ssize_t n = write(f->fd, buf + total, want);
-        if (n > 0) { // If success
-            total += (size_t)n;
-            continue; // Continue writing
+    // Initialize write cache if not already initialized
+    if (!f->write_active) {
+        off_t cur = lseek(f->fd, 0, SEEK_CUR);
+        if (cur != -1) {
+            f->wtag = cur;
         }
-        else {
-            // n == -1 => error
-            if (n == 0 || errno == EINTR || errno == EAGAIN) {
-                continue; // If error is recoverable, try again
-            }
-            if (total > 0) {
-                return (ssize_t)total; // short read, cannot recover
-            }
-            else {
-                return -1; // cannot recover
-            }
-        }
+        f->write_active = true;
     }
-    // return number of bytes successfully written
+    while (total < sz) {
+        // Find space left in cache
+        size_t space = (size_t)(io61_file::bufsize - f->wcount);
+        if (space == 0) {
+            // If the cache is full, flush it
+            if (flush_write_cache(f) < 0) {
+                // If some bytes were already consumed by cache, short write, otherwise error
+                return (total > 0) ? (ssize_t)total : -1;
+            }
+            // Update space left in cache
+            space = (size_t)(io61_file::bufsize - f->wcount);
+        }
+        // Find number of bytes to write 
+        size_t want = sz - total;
+        size_t ncopy = (want < space ? want : space);
+
+        // Write the bytes into the cache
+        memcpy(f->wbuf + f->wcount, buf + total, ncopy);
+        f->wcount += ncopy;
+        total += ncopy;
+    }
+
     return (ssize_t)total;
 }
+
 
 // io61_flush(f)
 //    If `f` was opened write-only, `io61_flush(f)` forces a write of any
@@ -215,9 +259,19 @@ ssize_t io61_write(io61_file* f, const unsigned char* buf, size_t sz) {
 //    drop any data cached for reading.
 
 int io61_flush(io61_file* f) {
-    (void) f;
+    // If read-only
+    if ((f->mode & O_ACCMODE) == O_RDONLY) {
+        return 0;
+    }
+    // If write-only
+    if (f->write_active && f->wcount > 0) {
+        if (flush_write_cache(f) < 0) {
+            return -1;
+        }
+    }
     return 0;
 }
+
 
 
 // io61_seek(f, off)
@@ -225,15 +279,27 @@ int io61_flush(io61_file* f) {
 //    Returns 0 on success and -1 on failure.
 
 int io61_seek(io61_file* f, off_t off) {
-    off_t r = lseek(f->fd, (off_t) off, SEEK_SET);
-    // Ignore the returned offset unless it’s an error.
-    if (r == -1) {
-        return -1;
+    // Flush the write cache
+    if (f->write_active && f->wcount > 0) {
+        if (flush_write_cache(f) < 0) {
+            return -1;
+        }
     }
-    // Invalidate read cache at new position
+    // Update the file's offset
+    off_t r = lseek(f->fd, off, SEEK_SET);
+    if (r == -1) return -1;
+
+    // Invalidate the read cache
     f->tag = f->pos_tag = f->end_tag = off;
+
+    // Reset write cache
+    f->write_active = false;
+    f->wcount = 0;
+    f->wtag = off;
+
     return 0;
 }
+
 
 // You shouldn't need to change these functions.
 
