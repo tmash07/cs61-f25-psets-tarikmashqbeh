@@ -7,15 +7,61 @@
 // io61.cc
 //    YOUR CODE HERE!
 
-
 // io61_file
 //    Data structure for io61 file wrappers. Add your own stuff.
 
 struct io61_file {
     int fd = -1;     // file descriptor
     int mode;        // open mode (O_RDONLY or O_WRONLY)
+
+    // `bufsiz` is the cache block size
+    static constexpr off_t bufsize = 4096;
+    // Cached data is stored in `cbuf`
+    unsigned char cbuf[bufsize];
+
+    // The following “tags” are addresses—file offsets—that describe the cache’s contents.
+    // `tag`: File offset of first byte of cached data (0 when file is opened).
+    off_t tag;
+    // `end_tag`: File offset one past the last byte of cached data (0 when file is opened).
+    off_t end_tag;
+    // `pos_tag`: Cache position: file offset of the cache.
+    // In read caches, this is the file offset of the next character to be read.
+    off_t pos_tag;
 };
 
+ssize_t io61_fill(io61_file* f) {
+    // Set the cache as empty
+    f->tag = f->pos_tag = f->end_tag;
+
+    while(true) {
+        // Fill the buffer with new bytes.
+        ssize_t n = read(f->fd, f->cbuf, (size_t)f->bufsize);
+
+        if (n > 0) { // If success (partial or whole)
+            // Update span of cache
+            f->end_tag = f->tag + n;
+
+            // Check invariants
+            assert(f->tag <= f->pos_tag && f->pos_tag <= f->end_tag);
+            assert((off_t)(f->end_tag - f->tag) <= f->bufsize);
+
+            return n;
+        }
+        else if (n == 0) { // End of file
+            // Leave cache empty
+            errno = 0;
+            return 0;
+        }
+        else { // error
+            if (errno == EINTR || errno == EAGAIN) {
+                // Retry the read
+                continue;
+            }
+            // Cannot recover
+            return -1;
+        }
+    }
+}
 
 // io61_fdopen(fd, mode)
 //    Returns a new io61_file for file descriptor `fd`. `mode` is either
@@ -27,8 +73,10 @@ io61_file* io61_fdopen(int fd, int mode) {
     io61_file* f = new io61_file;
     f->fd = fd;
     f->mode = mode;
+    f->tag = f->pos_tag = f->end_tag = 0;
     return f;
 }
+
 
 
 // io61_close(f)
@@ -47,18 +95,19 @@ int io61_close(io61_file* f) {
 //    which equals -1, on end of file or error.
 
 int io61_readc(io61_file* f) {
-    unsigned char ch;
-    ssize_t nr = read(f->fd, &ch, 1);
-    if (nr != 1) {
-        assert(nr == 0 || nr == -1);
-        if (nr == 0) {
-            errno = 0; // clear `errno` to indicate EOF
+    if (f->pos_tag == f->end_tag) {
+        ssize_t fr = io61_fill(f);
+        if (fr == 0) { // End of file
+            return -1;
         }
-        return -1;
+        else if (fr < 0) {    // hard error
+            return -1;
+        }
     }
+    int ch = f->cbuf[f->pos_tag - f->tag];
+    ++f->pos_tag;
     return ch;
 }
-
 
 // io61_read(f, buf, sz)
 //    Reads up to `sz` bytes from `f` into `buf`. Returns the number of
@@ -75,39 +124,30 @@ ssize_t io61_read(io61_file* f, unsigned char* buf, size_t sz) {
     if (sz == 0) {
         return 0;
     }
+    
+    size_t copied = 0;
+    while (copied < sz) {
+        if (f->pos_tag == f->end_tag) { // If cache is empty 
+            ssize_t fr = io61_fill(f);
+            if (fr == 0) { // End of file
+                return (copied > 0) ? (ssize_t)copied : 0;
+            }
+            else if (fr < 0) { // error
+                return (copied > 0) ? (ssize_t)copied : -1;
+            }
+        }
+        // Calculate number of bytes copied by finding minimum of wanted bytes and available bytes
+        size_t avail = (size_t)(f->end_tag - f->pos_tag);
+        size_t want = sz - copied;
+        size_t copy = (avail < want ? avail : want);
 
-    size_t total = 0;
-    while (total < sz) {
-        // Calculate and attempt to read the remaining bytes wanted
-        size_t want = sz - total;
-        ssize_t n = read(f->fd, buf + total, want);
-        if (n > 0) { // If successful
-            total += (size_t)n;
-            continue; // continue reading until sz is reached
-        }
-        else if (n == 0) { // If partial read
-            if (total == 0) { // End of file
-                errno = 0;           
-                return 0;
-            }
-            else { // Short read
-                return static_cast<ssize_t>(total);
-            }
-        }
-        else { // Error
-            if (errno == EINTR || errno == EAGAIN) {
-                continue; // if error is recoverable, retry read
-            }
-            if (total > 0) {
-                return (ssize_t)total; // short read, cannot recover
-            }
-            else {
-                return -1; // cannot recover
-            }
-        }
+        // Read the bytes from the cache (memcpy for speed)
+        memcpy(buf + copied, f->cbuf + (f->pos_tag - f->tag), copy);
+        f->pos_tag += copy;
+        copied += copy;
     }
-    // Return number of bytes successfully read
-    return (ssize_t)total; 
+
+    return (ssize_t)copied;
 }
 
 
@@ -146,7 +186,7 @@ ssize_t io61_write(io61_file* f, const unsigned char* buf, size_t sz) {
         size_t want = sz - total;
         ssize_t n = write(f->fd, buf + total, want);
         if (n > 0) { // If success
-            total += (size_t)n; 
+            total += (size_t)n;
             continue; // Continue writing
         }
         else {
@@ -165,8 +205,6 @@ ssize_t io61_write(io61_file* f, const unsigned char* buf, size_t sz) {
     // return number of bytes successfully written
     return (ssize_t)total;
 }
-
-
 
 // io61_flush(f)
 //    If `f` was opened write-only, `io61_flush(f)` forces a write of any
@@ -192,9 +230,10 @@ int io61_seek(io61_file* f, off_t off) {
     if (r == -1) {
         return -1;
     }
+    // Invalidate read cache at new position
+    f->tag = f->pos_tag = f->end_tag = off;
     return 0;
 }
-
 
 // You shouldn't need to change these functions.
 
