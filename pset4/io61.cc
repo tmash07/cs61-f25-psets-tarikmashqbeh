@@ -15,7 +15,7 @@ struct io61_file {
     int mode;
 
     // Size of the cache block
-    static constexpr off_t bufsize = 4096;
+    static constexpr off_t bufsize = 65536;
 
     unsigned char cbuf[bufsize]; // Read buffer 
     // The following “tags” are addresses—file offsets—that describe the cache’s contents.
