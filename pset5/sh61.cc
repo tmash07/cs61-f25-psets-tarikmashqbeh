@@ -67,11 +67,35 @@ command::~command() {
 void command::run() {
     assert(this->pid == -1);
     assert(this->args.size() > 0);
-    // Your code here!
 
-    fprintf(stderr, "command::run not done yet\n");
+    // Build argv with size for arguments plus nullptr
+    std::vector<char*> argv;
+    argv.reserve(this->args.size() + 1);
+    // Add arguments/nullptr to argv
+    for (auto& s : this->args) {
+        argv.push_back(const_cast<char*>(s.c_str()));
+    }
+    argv.push_back(nullptr);
+
+    pid_t p = fork();
+    if (p < 0) {
+        // If forks fails, exit 
+        perror("fork");
+        _exit(EXIT_FAILURE);
+    }
+
+    if (p == 0) {
+        // Execute the command
+        execvp(argv[0], argv.data());
+
+        // If execvp returns, exit
+        perror(argv[0]);
+        _exit(EXIT_FAILURE);
+    }
+
+    // Store child pid
+    this->pid = p;
 }
-
 
 // run_line(clp)
 //    Run the command line contained in `command_line_parser clp`.
@@ -98,13 +122,48 @@ void command::run() {
 //    PHASE 5: Change the loop to handle background conditional chains.
 //       This may require adding another call to `fork()`!
 
+
+
 void run_line(command_line_parser clp) {
-    command* c = new command;
-    for (auto tok = clp.token_begin(); tok != clp.end(); ++tok) {
-        c->args.push_back(tok.str());
+    // Token iterator over the whole command line
+    auto tok = clp.token_begin();
+
+    // Loop over one or more commands separated by ';'
+    while (tok != clp.end()) {
+        // Build a single command from tokens up to the next ';' or end-of-line
+        command* c = new command;
+
+        // Collect arguments for this command
+        for (; tok != clp.end() && tok.type() != TYPE_SEQUENCE; ++tok) {
+            // For Phase 2 we only care about simple words (no pipes, &&, ||, etc.)
+            // Those show up as TYPE_NORMAL tokens.
+            if (tok.type() == TYPE_NORMAL) {
+                c->args.push_back(tok.str());
+            }
+            // We ignore other token types for now (redirections/conditionals/pipes
+            // will be handled in later phases).
+        }
+
+        // If we actually collected a command, run it and wait for it
+        if (!c->args.empty()) {
+            c->run();
+
+            if (c->pid > 0) {
+                int status;
+                // Retry waitpid if interrupted by a signal
+                while (waitpid(c->pid, &status, 0) == -1 && errno == EINTR) {
+                    // nothing; just retry
+                }
+            }
+        }
+
+        delete c;
+
+        // If we stopped because of a ';', skip it and move to the next command
+        if (tok != clp.end() && tok.type() == TYPE_SEQUENCE) {
+            ++tok;
+        }
     }
-    c->run();
-    delete c;
 }
 
 
