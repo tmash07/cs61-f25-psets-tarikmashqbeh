@@ -3,7 +3,7 @@ Author and collaborators
 
 Primary student
 ---------------
-(Your name.)
+Tarik Mashqbeh
 
 
 Collaborators
