@@ -40,11 +40,12 @@ struct io61_file {
 
 // Helper function to check if a requested range overlaps with existing locks
 bool can_lock(io61_file* f, off_t off, off_t len) {
+    // For each existing lock/range
     for (const auto& range : f->locked_ranges) {
         off_t r_off = range.first;
         off_t r_len = range.second;
-        // Overlap check: not (end1 <= start2 || end2 <= start1)
-        if (!(off + len <= r_off || r_off + r_len <= off)) {
+        // Check for overlap
+        if (off + len > r_off && r_off + r_len > off) {
             return false;
         }
     }
@@ -95,6 +96,8 @@ int io61_close(io61_file* f) {
 static int io61_fill(io61_file* f);
 
 int io61_readc(io61_file* f) {
+    // Lock to ensure only one thread is manipulating the buffer, other threads must wait
+    // Lock automatically releases when function returns (out of scope)
     std::unique_lock<std::mutex> guard(f->mutex);
     assert(!f->positioned);
     if (f->pos_tag == f->end_tag) {
@@ -120,6 +123,8 @@ int io61_readc(io61_file* f) {
 //    This is called a “short read.”
 
 ssize_t io61_read(io61_file* f, unsigned char* buf, size_t sz) {
+    // Lock to ensure only one thread is manipulating the buffer, other threads must wait
+    // Lock automatically releases when function returns (out of scope)
     std::unique_lock<std::mutex> guard(f->mutex);
     assert(!f->positioned);
     size_t nread = 0;
@@ -149,6 +154,8 @@ ssize_t io61_read(io61_file* f, unsigned char* buf, size_t sz) {
 static int io61_flush_helper(io61_file* f);
 
 int io61_writec(io61_file* f, int c) {
+    // Lock to ensure only one thread is manipulating the buffer, other threads must wait
+    // Lock automatically releases when function returns (out of scope)
     std::unique_lock<std::mutex> guard(f->mutex);
     assert(!f->positioned);
     if (f->pos_tag == f->tag + f->cbufsz) {
@@ -173,6 +180,8 @@ int io61_writec(io61_file* f, int c) {
 //    before the error occurred.
 
 ssize_t io61_write(io61_file* f, const unsigned char* buf, size_t sz) {
+    // Lock to ensure only one thread is manipulating the buffer, other threads must wait
+    // Lock automatically releases when function returns (out of scope)
     std::unique_lock<std::mutex> guard(f->mutex);
     assert(!f->positioned);
     size_t nwritten = 0;
@@ -209,6 +218,8 @@ static int io61_flush_dirty(io61_file* f);
 static int io61_flush_dirty_positioned(io61_file* f);
 static int io61_flush_clean(io61_file* f);
 
+// Helper function to flush the file
+// We move this fuction external to the io61_flush function to avoid deadlocks
 static int io61_flush_helper(io61_file* f) {
     if (f->dirty && f->positioned) {
         return io61_flush_dirty_positioned(f);
@@ -220,7 +231,10 @@ static int io61_flush_helper(io61_file* f) {
 }
 
 int io61_flush(io61_file* f) {
+    // Lock to ensure only one thread is manipulating the buffer, other threads must wait
+    // Lock automatically releases when function returns (out of scope)
     std::unique_lock<std::mutex> guard(f->mutex);
+    // Flush the file
     return io61_flush_helper(f);
 }
 
@@ -230,6 +244,8 @@ int io61_flush(io61_file* f) {
 //    Returns 0 on success and -1 on failure.
 
 int io61_seek(io61_file* f, off_t off) {
+    // Lock to ensure only one thread is manipulating the buffer, other threads must wait
+    // Lock automatically releases when function returns (out of scope)
     std::unique_lock<std::mutex> guard(f->mutex);
     int r = io61_flush_helper(f);
     if (r == -1) {
@@ -331,6 +347,8 @@ static int io61_pfill(io61_file* f, off_t off);
 
 ssize_t io61_pread(io61_file* f, unsigned char* buf, size_t sz,
                    off_t off) {
+    // Lock to ensure only one thread is manipulating the buffer, other threads must wait
+    // Lock automatically releases when function returns (out of scope)
     std::unique_lock<std::mutex> guard(f->mutex);
     if (!f->positioned || off < f->tag || off >= f->end_tag) {
         if (io61_pfill(f, off) == -1) {
@@ -353,6 +371,8 @@ ssize_t io61_pread(io61_file* f, unsigned char* buf, size_t sz,
 
 ssize_t io61_pwrite(io61_file* f, const unsigned char* buf, size_t sz,
                     off_t off) {
+    // Lock to ensure only one thread is manipulating the buffer, other threads must wait
+    // Lock automatically releases when function returns (out of scope)
     std::unique_lock<std::mutex> guard(f->mutex);
     if (!f->positioned || off < f->tag || off >= f->end_tag) {
         if (io61_pfill(f, off) == -1) {
@@ -407,10 +427,12 @@ static int io61_pfill(io61_file* f, off_t off) {
 
 int io61_try_lock(io61_file* f, off_t off, off_t len, int locktype) {
     (void) locktype;
+    // Try to acquire the mutex
     std::unique_lock<std::mutex> guard(f->mutex, std::try_to_lock);
     if (!guard.owns_lock()) {
-        return -1;
+        return -1; // If it is not availabile, exit
     }
+    // Check if the range is available
     if (can_lock(f, off, len)) {
         f->locked_ranges.push_back({off, len});
         return 0;
@@ -429,10 +451,14 @@ int io61_try_lock(io61_file* f, off_t off, off_t len, int locktype) {
 //    your code need not detect deadlock.
 
 int io61_lock(io61_file* f, off_t off, off_t len, int locktype) {
+    (void) locktype;
+    // Acquire the mutex
     std::unique_lock<std::mutex> guard(f->mutex);
+    // Wait until the range is available
     while (!can_lock(f, off, len)) {
         f->cv.wait(guard);
     }
+    // Add the range to the list of locked ranges
     f->locked_ranges.push_back({off, len});
     return 0;
 }
@@ -444,15 +470,17 @@ int io61_lock(io61_file* f, off_t off, off_t len, int locktype) {
 //    previously acquired a lock on that offset range.
 
 int io61_unlock(io61_file* f, off_t off, off_t len) {
+    // Acquire the mutex
     std::lock_guard<std::mutex> guard(f->mutex);
+    // Find the range to unlock
     for (auto it = f->locked_ranges.begin(); it != f->locked_ranges.end(); ++it) {
         if (it->first == off && it->second == len) {
             f->locked_ranges.erase(it);
-            f->cv.notify_all(); // Wake up waiters to re-check
+            f->cv.notify_all(); // Notify waiting threads to recheck
             return 0;
         }
     }
-    return -1; // Specific lock not found
+    return -1; // Lock not found
 }
 
 
