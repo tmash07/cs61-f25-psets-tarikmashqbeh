@@ -1,4 +1,4 @@
-PROGRAMS := ftxunlocked ftxxfer ftxrocket ftxblockchain
+PROGRAMS := ftxunlocked ftxxfer ftxrocket ftxblockchain sh_test # added sh_test
 default: $(PROGRAMS)
 
 # Default optimization level

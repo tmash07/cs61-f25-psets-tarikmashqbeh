@@ -6,6 +6,8 @@
 #include <condition_variable>
 #include <sys/types.h>
 #include <sys/stat.h>
+#include <thread>
+#include <sys/file.h>
 
 // io61.cc
 //    YOUR CODE HERE!
@@ -13,6 +15,14 @@
 
 // io61_file
 //    Data structure for io61 file wrappers.
+
+// Struct for tracking locks
+struct Lock {
+    off_t off;
+    off_t len;
+    int type;
+    std::thread::id owner;
+};
 
 struct io61_file {
     int fd = -1;     // file descriptor
@@ -31,7 +41,7 @@ struct io61_file {
     // Wait for locks to become available
     std::condition_variable cv;
     // Tracks current locks
-    std::vector<std::pair<off_t, off_t>> locked_ranges; 
+    std::vector<Lock> locked_ranges; 
 
     // Positioned mode
     std::atomic<bool> dirty = false;  // has cache been written?
@@ -39,14 +49,15 @@ struct io61_file {
 };
 
 // Helper function to check if a requested range overlaps with existing locks
-bool can_lock(io61_file* f, off_t off, off_t len) {
+bool can_lock(io61_file* f, off_t off, off_t len, int locktype) {
     // For each existing lock/range
-    for (const auto& range : f->locked_ranges) {
-        off_t r_off = range.first;
-        off_t r_len = range.second;
-        // Check for overlap
-        if (off + len > r_off && r_off + r_len > off) {
-            return false;
+    for (const auto& lock : f->locked_ranges) {
+        // Check for overlap/exclusivity
+        if (off + len > lock.off && lock.off + lock.len > off) {
+            // If overlap, check exclusivity
+            if (locktype == LOCK_EX || lock.type == LOCK_EX) {
+                return false; // Conflict if either lock is exclusive
+            }
         }
     }
     return true;
@@ -426,15 +437,14 @@ static int io61_pfill(io61_file* f, off_t off) {
 //    always lock nonoverlapping ranges.
 
 int io61_try_lock(io61_file* f, off_t off, off_t len, int locktype) {
-    (void) locktype;
     // Try to acquire the mutex
     std::unique_lock<std::mutex> guard(f->mutex, std::try_to_lock);
     if (!guard.owns_lock()) {
         return -1; // If it is not availabile, exit
     }
     // Check if the range is available
-    if (can_lock(f, off, len)) {
-        f->locked_ranges.push_back({off, len});
+    if (can_lock(f, off, len, locktype)) {
+        f->locked_ranges.push_back({off, len, locktype, std::this_thread::get_id()});
         return 0;
     }
     return -1;
@@ -451,15 +461,14 @@ int io61_try_lock(io61_file* f, off_t off, off_t len, int locktype) {
 //    your code need not detect deadlock.
 
 int io61_lock(io61_file* f, off_t off, off_t len, int locktype) {
-    (void) locktype;
     // Acquire the mutex
     std::unique_lock<std::mutex> guard(f->mutex);
     // Wait until the range is available
-    while (!can_lock(f, off, len)) {
+    while (!can_lock(f, off, len, locktype)) {
         f->cv.wait(guard);
     }
     // Add the range to the list of locked ranges
-    f->locked_ranges.push_back({off, len});
+    f->locked_ranges.push_back({off, len, locktype, std::this_thread::get_id()});
     return 0;
 }
 
@@ -474,7 +483,8 @@ int io61_unlock(io61_file* f, off_t off, off_t len) {
     std::lock_guard<std::mutex> guard(f->mutex);
     // Find the range to unlock
     for (auto it = f->locked_ranges.begin(); it != f->locked_ranges.end(); ++it) {
-        if (it->first == off && it->second == len) {
+        // Check that both range and owner match
+        if (it->off == off && it->len == len && it->owner == std::this_thread::get_id()) {
             f->locked_ranges.erase(it);
             f->cv.notify_all(); // Notify waiting threads to recheck
             return 0;
