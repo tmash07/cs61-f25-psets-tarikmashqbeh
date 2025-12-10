@@ -20,22 +20,26 @@ void fail(size_t sz);
 void success(size_t sz);
 
 /// m61_malloc(sz, file, line)
-///    Return a pointer to `sz` bytes of newly-allocated dynamic memory.
+///     Return a pointer to `sz` bytes of newly-allocated dynamic memory.
 void* m61_malloc(size_t sz, const char* file = __builtin_FILE(), int line = __builtin_LINE());
 
 /// m61_free(ptr, file, line)
-///    Free the memory space pointed to by `ptr`.
+///     Free the memory space pointed to by `ptr`.
 void m61_free(void* ptr, const char* file = __builtin_FILE(), int line = __builtin_LINE());
 
 /// m61_calloc(count, sz, file, line)
-///    Return a pointer to newly-allocated dynamic memory big enough to
-///    hold an array of `count` elements of `sz` bytes each. The memory
-///    is initialized to zero.
+///     Return a pointer to newly-allocated dynamic memory big enough to
+///     hold an array of `count` elements of `sz` bytes each. The memory
+///     is initialized to zero.
 void* m61_calloc(size_t count, size_t sz, const char* file = __builtin_FILE(), int line = __builtin_LINE());
 
+/// m61_realloc(ptr, sz, file, line)
+///     Changes the size of the dynamic allocation pointed to by `ptr`
+///     to hold at least `sz` bytes.
+void* m61_realloc(void* ptr, size_t sz, const char* file = __builtin_FILE(), int line = __builtin_LINE());
 
 /// m61_statistics
-///    Structure tracking memory statistics.
+///     Structure tracking memory statistics.
 struct m61_statistics {
     unsigned long long nactive;         // # active allocations
     unsigned long long active_size;     // # bytes in active allocations
@@ -48,16 +52,16 @@ struct m61_statistics {
 };
 
 /// m61_get_statistics()
-///    Return the current memory statistics.
+///     Return the current memory statistics.
 m61_statistics m61_get_statistics();
 
 /// m61_print_statistics()
-///    Print the current memory statistics.
+///     Print the current memory statistics.
 void m61_print_statistics();
 
 /// m61_print_leak_report()
-///    Print a report of all currently-active allocated blocks of dynamic
-///    memory.
+///     Print a report of all currently-active allocated blocks of dynamic
+///     memory.
 void m61_print_leak_report();
 
 

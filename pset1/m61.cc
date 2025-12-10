@@ -6,37 +6,77 @@
 #include <cinttypes>
 #include <cassert>
 #include <sys/mman.h>
-#include <unordered_map>
-#include <vector>
-#include <algorithm>
-#include <iostream>
-#include <unordered_set>
 
+// Memory buffer structure modeled after a linked list node (for list of buffers)
 struct m61_memory_buffer {
-    char* buffer;
-    size_t pos = 0;
-    size_t size = 8 << 20; /* 8 MiB */
+    char* buffer;                       // Pointer to the memory mapped region of the buffer
+    size_t pos = 0;                     // Bytes used in the buffer
+    size_t size;                        // Total size of the buffer
+    m61_memory_buffer* next = nullptr;  // Next buffer in the linked list
 
-    m61_memory_buffer();
+    m61_memory_buffer(size_t sz);
     ~m61_memory_buffer();
 };
 
-static m61_memory_buffer default_buffer;
+static m61_memory_buffer* buffer_list = nullptr;
+static constexpr size_t DEFAULT_BUFFER_SIZE = 8 << 20; // 8 MiB
 
-
-m61_memory_buffer::m61_memory_buffer() {
-    void* buf = mmap(nullptr,    // Place the buffer at a random address
-        this->size,              // Buffer should be 8 MiB big
-        PROT_WRITE,              // We want to read and write the buffer
-        MAP_ANON | MAP_PRIVATE, -1, 0);
-                                 // We want memory freshly allocated by the OS
-    assert(buf != MAP_FAILED);
-    this->buffer = (char*) buf;
+// Constructor for m61_memory_buffer, creates a new buffer of size sz, returns nullptr if failed
+m61_memory_buffer::m61_memory_buffer(size_t sz) : size(sz) {
+    void* buf = mmap(nullptr, this->size, PROT_WRITE,
+                     MAP_ANON | MAP_PRIVATE, -1, 0);
+    this->buffer = (buf == MAP_FAILED) ? nullptr : (char*)buf; // Handle failure of mmap
 }
 
+// Destructor for m61_memory_buffer, releases the buffer
 m61_memory_buffer::~m61_memory_buffer() {
-    munmap(this->buffer, this->size);
+    if (this->buffer) { // Ensure buffer exists before release
+        munmap(this->buffer, this->size);
+    }
 }
+
+/// Structs for handling internal metadata
+/// Each allocation has the layout: [Header (48 bytes)] [Data] [Padding with 0xBD guard] [Footer (8 bytes)]
+
+// Struct for header of an allocation (48 bytes)
+// Stores internal metadata for each allocation
+struct m61_header {
+    size_t size;            // Total block size (power of 2 for buddy system)
+    size_t user_size;       // Requested allocation size
+    const char* file;       // Source file (for error reporting)
+    m61_header* self;       // Self-pointer for validity checking
+    int line;               // Source line (for error reporting)
+    int status;             // 1 = allocated, 0 = free
+    unsigned int magic;     // Magic number for corruption detection
+    char padding[4];        // Padding to ensure 48-byte header
+};
+
+// Struct for footer of an allocation (8 bytes)
+// Used to detect wild writes beyond the end of an allocation
+struct m61_footer {
+    size_t size;            // Duplicate of total block size
+};
+
+// Struct for free list node
+struct m61_freenode {
+    m61_freenode* next;
+    m61_freenode* prev;
+};
+
+static constexpr unsigned int MAGIC = 0xDEADBEEF; // Magic number to detect corruption
+static constexpr size_t HEAD_SZ = sizeof(m61_header);  // 48 bytes
+static constexpr size_t FOOT_SZ = sizeof(m61_footer);  // 8 bytes
+
+/// Buddy allocation system works using free lists.
+/// Free blocks are stored in separate free lists (one per order).
+/// Allocation splits larger blocks in half until desired size is reached.
+/// Freeing coalesces buddy pairs into larger blocks using freenodes and order.
+
+static constexpr int MIN_ORDER = 6;
+static constexpr int MAX_ORDER = 23;
+static constexpr int NUM_ORDERS = MAX_ORDER + 1;
+
+static m61_freenode* free_lists[NUM_ORDERS];
 
 static m61_statistics memory_stats = {
     .nactive = 0, .active_size = 0, .ntotal = 0,
@@ -44,128 +84,109 @@ static m61_statistics memory_stats = {
     .heap_min = 0, .heap_max = 0
 };
 
-// Struct for storing freed blocks
-struct freeBlock {
-    char* address;
-    size_t sz;
-};
-// Struct for storing active blocks
-struct activeBlock {
-    size_t sz;
-    const char* file;
-    int line;
-};
-
-// Constant for trailing guard size (in case it needs changed)
-constexpr size_t guardSize = 16;
-constexpr unsigned char guardExpression = 0xDD;
-
-// Map for storing active allocations, vector for storing freed allocations, and vector for
-// storing start addresses of freed pointers that got merged with the tail
-static std::unordered_map<void*, activeBlock> activeAlloc;
-static std::vector<freeBlock> freedAlloc;
-static std::unordered_set<void*> trimmed;
-
-/// align(size_t sz)
-///     Given a size, rounds up to the next multiple of 16
-size_t align(size_t sz) {
-    return (sz + 15) & ~15;
+// Return the smallest order whose block size >= sz
+static int order_for_size(size_t sz) {
+    int order = MIN_ORDER;
+    size_t block_size = (size_t)1 << order;
+    while (block_size < sz && order < 64) {
+        ++order;
+        block_size <<= 1;
+    }
+    return order;
 }
 
-/// fail(size_t sz)
-///     Updates memory statistics for a failed allocation
-void fail(size_t sz) {
-    memory_stats.nfail++;
+// Return the block size for a given order
+static inline size_t size_for_order(int order) {
+    return (size_t)1 << order;
+}
+
+// Insert a free block into the free list for the given order
+static void free_list_insert(m61_freenode* node, int order) {
+    node->next = free_lists[order];
+    node->prev = nullptr;
+    if (free_lists[order]) { // If free list of this order is not empty
+        free_lists[order]->prev = node;
+    }
+    free_lists[order] = node;
+}
+
+// Remove a free block from the free list for the given order
+static void free_list_remove(m61_freenode* node, int order) {
+    // Remove node from free list
+    if (node->prev) {
+        node->prev->next = node->next;
+    } else {
+        free_lists[order] = node->next;
+    }
+    if (node->next) {
+        node->next->prev = node->prev;
+    }
+    // Reset node pointers
+    node->next = nullptr;
+    node->prev = nullptr;
+}
+
+// Initialize header and footer for a block
+static void write_boundary_tags(void* block, size_t block_size, size_t user_size,
+                                 int status, const char* file, int line) {
+    m61_header* h = (m61_header*)block;
+    h->size = block_size;
+    h->user_size = user_size;
+    h->file = file;
+    h->line = line;
+    h->status = status;
+    h->magic = MAGIC;
+    h->self = h;
+
+    m61_footer* f = (m61_footer*)((char*)block + block_size - FOOT_SZ);
+    f->size = block_size;
+}
+
+// Fill padding region with guard
+static void fill_padding(m61_header* h, size_t user_size) {
+    size_t block_size = h->size;
+    size_t padding_start = HEAD_SZ + user_size;
+    size_t padding_end = block_size - FOOT_SZ;
+    if (padding_end > padding_start) { // Ensure padding region exists
+        memset((char*)h + padding_start, 0xBD, padding_end - padding_start);
+    }
+}
+
+// Find which buffer contains a pointer
+static m61_memory_buffer* find_buffer(void* ptr) {
+    for (m61_memory_buffer* b = buffer_list; b; b = b->next) {
+        if ((char*)ptr >= b->buffer && (char*)ptr < b->buffer + b->size) {
+            return b;
+        }
+    }
+    return nullptr;
+}
+
+// Record a failed allocation
+static void record_fail(size_t sz) {
+    ++memory_stats.nfail;
     memory_stats.fail_size += sz;
 }
 
-/// success(size_t sz)
-///     Updates memory statistics for a successful allocation
-void success(size_t sz) {
-    memory_stats.ntotal++;
-    memory_stats.nactive++;
+// Record a successful allocation
+static void record_success(size_t sz) {
+    ++memory_stats.ntotal;
+    ++memory_stats.nactive;
     memory_stats.active_size += sz;
     memory_stats.total_size += sz;
 }
 
-/// insertFreedAlloc(freeBlock freed)
-///     Inserts a freed allocation into the freedAlloc vector, keeping
-///     the vector sorted by ptr memory address.
-static void insertFreedAlloc(const freeBlock& freed) {
-    // Variable to store index where freed is inserted
-    size_t i = 0;
-
-    // Handle case where freed is the first freed pointer
-    // or freed has a larger address than all other freed pointers
-    if (freedAlloc.empty()) {
-        freedAlloc.push_back(freed);
-    } else if (freedAlloc[freedAlloc.size() - 1].address < freed.address) {
-        freedAlloc.push_back(freed);
-        i = freedAlloc.size() - 1;
-    } else {
-        // Insert the freed block before the first pointer that has a larger address
-        for (size_t j = 0; j < freedAlloc.size(); ++j) {
-            if (freedAlloc[j].address > freed.address) {
-                freedAlloc.insert(freedAlloc.begin() + j, freed);
-                i = j;
-                break;
-            }
-        }
-    }
-    // Coalesce with next freed block (if possible)
-    if (i < freedAlloc.size() - 1 && freedAlloc[i].address + freedAlloc[i].sz == freedAlloc[i + 1].address) {
-        freedAlloc[i].sz += freedAlloc[i + 1].sz;
-        freedAlloc.erase(freedAlloc.begin() + i + 1);
-    }
-    // Coalesce with previous freed block (if possible)
-    if (i > 0 && freedAlloc[i - 1].address + freedAlloc[i - 1].sz == freedAlloc[i].address) {
-        freedAlloc[i - 1].sz += freedAlloc[i].sz;
-        freedAlloc.erase(freedAlloc.begin() + i);
-    }
-    // Coalesce with default buffer (if possible)
-    char* heap_end = default_buffer.buffer + default_buffer.pos;
-    freeBlock& last = freedAlloc.back();
-
-    if (last.address + last.sz == heap_end) {
-        default_buffer.pos -= last.sz;
-        freedAlloc.pop_back();
-    }
-
+// Report an invalid free
+static void report_error(const char* file, int line, void* ptr, const char* msg) {
+    fprintf(stderr, "MEMORY BUG: %s:%d: invalid free of pointer %p, %s\n",
+            file, line, ptr, msg);
+    abort();
 }
-
-/// findFreeSpace(size_t sz)
-///     Finds smallest free space in the vector of freedAlloc that is large
-///     enough to accomodate sz
-static void* findFreeSpace(size_t sz) {
-    // Handle case of empty freedAlloc
-    if (freedAlloc.size() == 0) {
-        return nullptr;
-    }
-    // Find the smallest free space that is large enough for sz
-    size_t bestIndex = (size_t)-1;
-    size_t bestSz = (size_t)-1;
-    for (size_t i = 0; i < freedAlloc.size(); ++i) {
-        if (freedAlloc[i].sz >= sz && freedAlloc[i].sz < bestSz) {
-            bestSz = freedAlloc[i].sz;
-            bestIndex = i;
-            // If perfect fit is found
-            if (bestSz == sz) break;
-        }
-    }
-    // Handle case where no sufficient space was found
-    if (bestSz == (size_t)-1) {
-        return nullptr;
-    }
-    void* ptr = freedAlloc[bestIndex].address;
-    // Handle case where perfect match was found
-    if (bestSz == sz) {
-        freedAlloc.erase(freedAlloc.begin() + bestIndex);
-    }
-    else {
-        freedAlloc[bestIndex].address += sz;
-        freedAlloc[bestIndex].sz -= sz;
-    }
-    return ptr;
+// Report a wild write
+static void report_wild_write(const char* file, int line, void* ptr) {
+    fprintf(stderr, "MEMORY BUG: %s:%d: detected wild write during free of pointer %p\n",
+            file, line, ptr);
+    abort();
 }
 
 /// m61_malloc(sz, file, line)
@@ -175,59 +196,131 @@ static void* findFreeSpace(size_t sz) {
 ///    The allocation request was made at source code location `file`:`line`.
 
 void* m61_malloc(size_t sz, const char* file, int line) {
-    (void) file, (void) line;   // avoid uninitialized variable warnings
-    // Guard against overflow when finding aligned_sz
-    if (sz > SIZE_MAX - 15) {
-        fail(sz);
+    // Check for overflow
+    if (sz > SIZE_MAX - HEAD_SZ - FOOT_SZ) {
+        record_fail(sz);
         return nullptr;
     }
-    // Find padding needed for 16-byte alignment, then combine with guard
-    size_t total = sz + guardSize;
-    size_t aligned_total = align(total);
-    // Try to fit the allocation into previously freed space
-    void* ptr = findFreeSpace(aligned_total);
-    // If that fails, try new space
-    if (!ptr) {
-        // Check if space is available for padded allocation, guarding against
-        // overflow when calculating available space
-        if (aligned_total <= default_buffer.size - default_buffer.pos) {
-            // Space is available, allocate memory
-            ptr = &default_buffer.buffer[default_buffer.pos];
-            default_buffer.pos += aligned_total;
+
+    size_t total_size = sz + HEAD_SZ + FOOT_SZ;
+    int order = order_for_size(total_size);
+
+    // If the allocation is too large, use a dedicated buffer
+    if (order > MAX_ORDER) {
+        m61_memory_buffer* buf = new m61_memory_buffer(total_size);
+        if (!buf->buffer) { // If allocation failed
+            delete buf;
+            record_fail(sz);
+            return nullptr;
         }
-        else {
-            // Not enough space left in default buffer for allocation
-            ptr = nullptr;
+        // Add buffer to list 
+        buf->next = buffer_list;
+        buffer_list = buf;
+        buf->pos = total_size;
+
+        // Initialize header and footer 
+        m61_header* h = (m61_header*)buf->buffer;
+        write_boundary_tags(h, total_size, sz, 1, file, line);
+        fill_padding(h, sz);
+
+        // Update heap bounds
+        if (total_size > memory_stats.heap_max) {
+            memory_stats.heap_max = total_size;
         }
+        if (total_size < memory_stats.heap_min) {
+            memory_stats.heap_min = total_size;
+        }
+
+        // Update statistics
+        record_success(sz);
+        return (char*)h + HEAD_SZ;
     }
-    if (ptr) {
-        // Update guard space
-        std::memset(reinterpret_cast<unsigned char*>(ptr) + sz, guardExpression, guardSize);
-        // Update set of tail trims
-        if (trimmed.contains(static_cast<char*>(ptr))) {
-            trimmed.erase(static_cast<char*>(ptr));
+
+    // If allocation is not too large, we use buddy system to allocate
+    size_t block_size = size_for_order(order);
+
+    // If buffer list is empty, intiailize first buffer
+    if (!buffer_list) {
+        m61_memory_buffer* buf = new m61_memory_buffer(DEFAULT_BUFFER_SIZE);
+        if (!buf->buffer) { // If allocation failed
+            delete buf;
+            record_fail(sz);
+            return nullptr;
         }
-        // Handle successful allocation
-        success(sz);
-        activeAlloc[ptr] = { sz, file, line };
-        
-        auto addr = reinterpret_cast<uintptr_t>(ptr);
-        auto endAddr = addr + aligned_total;
-        // Adjust heap_min for intial case or new smallest address
-        if (memory_stats.heap_min == 0 || addr < memory_stats.heap_min) {
-            memory_stats.heap_min = addr;
-        }
-        // Adjust heap_max for new largest address
-        if (endAddr > memory_stats.heap_max) {
-            memory_stats.heap_max = endAddr;
-        }
+        // Add buffer to list
+        buffer_list = buf;
+        buf->pos = DEFAULT_BUFFER_SIZE;
+        // Initialize header and footer
+        m61_header* h = (m61_header*)buf->buffer;
+        write_boundary_tags(h, DEFAULT_BUFFER_SIZE, 0, 0, "?", 0);
+        // Update free list
+        free_list_insert((m61_freenode*)((char*)h + HEAD_SZ), MAX_ORDER);
     }
-    else {
-        // Handle failed allocation
-        fail(sz);
+
+    // Find a free block of sufficient order
+    int k = order;
+    while (k <= MAX_ORDER && !free_lists[k]) {
+        ++k;
     }
-    return ptr;
+
+    // If none found, allocate a new buffer
+    if (k > MAX_ORDER) {
+        m61_memory_buffer* buf = new m61_memory_buffer(DEFAULT_BUFFER_SIZE);
+        if (!buf->buffer) { // If allocation failed
+            delete buf;
+            record_fail(sz);
+            return nullptr;
+        }
+        // Add buffer to list
+        buf->next = buffer_list;
+        buffer_list = buf;
+        buf->pos = DEFAULT_BUFFER_SIZE;
+
+        // Initialize header and footer
+        m61_header* h = (m61_header*)buf->buffer;
+        write_boundary_tags(h, DEFAULT_BUFFER_SIZE, 0, 0, "?", 0);
+        // Update free list
+        free_list_insert((m61_freenode*)((char*)h + HEAD_SZ), MAX_ORDER);
+        k = MAX_ORDER;
+    }
+
+    // Remove the chosen block from its free list
+    m61_freenode* node = free_lists[k];
+    free_list_remove(node, k);
+    m61_header* block = (m61_header*)((char*)node - HEAD_SZ);
+
+    // Split block until minimum sufficient order is reached
+    while (k > order) {
+        --k;
+        size_t split_size = size_for_order(k);
+
+        // Right "buddy" goes to free list
+        m61_header* buddy = (m61_header*)((char*)block + split_size);
+        write_boundary_tags(buddy, split_size, 0, 0, "?", 0);
+        free_list_insert((m61_freenode*)((char*)buddy + HEAD_SZ), k);
+
+        // Left "buddy" becomes the used block
+        write_boundary_tags(block, split_size, 0, 0, "?", 0);
+    }
+
+    // Update header/footer/padding of chosen block
+    write_boundary_tags(block, block_size, sz, 1, file, line);
+    fill_padding(block, sz);
+
+    // Update heap bounds
+    uintptr_t addr = (uintptr_t)((char*)block + HEAD_SZ);
+    if (memory_stats.heap_min == 0 || addr < memory_stats.heap_min) {
+        memory_stats.heap_min = addr;
+    }
+    if (addr + sz > memory_stats.heap_max) {
+        memory_stats.heap_max = addr + sz;
+    }
+
+    // Update statistics
+    record_success(sz);
+    return (char*)block + HEAD_SZ;
 }
+
 
 /// m61_free(ptr, file, line)
 ///    Frees the memory allocation pointed to by `ptr`. If `ptr == nullptr`,
@@ -236,64 +329,120 @@ void* m61_malloc(size_t sz, const char* file, int line) {
 ///    `file`:`line`.
 
 void m61_free(void* ptr, const char* file, int line) {
-    // avoid uninitialized variable warnings
-    (void) ptr, (void) file, (void) line;
-    // Handle nullptr case
-    if (ptr == nullptr) {
-        return;
+    if (!ptr) return; // Handle nullptr case
+
+    // Find buffer containing pointer
+    char* p = (char*)ptr;
+    m61_memory_buffer* buf = find_buffer(ptr);
+
+    // Check if pointer is in heap
+    if (!buf || p < buf->buffer + HEAD_SZ) {
+        report_error(file, line, ptr, "not in heap");
     }
-    // Handle cases where ptr does not point to an active allocation
-    // Three cases: not in heap, double free, invalid free
-    char* p = reinterpret_cast<char*>(ptr);
-    // Handle not in heap case
-    if (p < default_buffer.buffer || p >= default_buffer.buffer + default_buffer.size) {
-        std::cerr << "MEMORY BUG: " << file << ":" << line
-            << ": invalid free of pointer " << ptr << ", not in heap" << std::endl;
-        abort();
-    }
-    auto it = activeAlloc.find(ptr);
-    if (it == activeAlloc.end()) {
-        // Handle double frees (ptr was already freed)
-        if (trimmed.contains(ptr)) {
-            std::cerr << "MEMORY BUG: " << file << ":" << line
-                << ": invalid free of pointer " << ptr << ", double free" << std::endl;
-        }
-        else { // Handle invalid frees (ptr was never allocated)
-            std::cerr << "MEMORY BUG: " << file << ":" << line
-                << ": invalid free of pointer " << ptr << ", not allocated" << std::endl;
-            // Handle case where ptr is inside an active block
-            auto insideActive = std::find_if(activeAlloc.begin(), activeAlloc.end(),
-                [p](const auto& pair) {
-                    char* start = static_cast<char*>(pair.first);
-                    return p > start && p < start + pair.second.sz;
-                });
-            char* start = static_cast<char*>(insideActive->first);
-            size_t offset = static_cast<size_t>(p - start);
-            if (insideActive != activeAlloc.end()) {
-                std::cerr << "  " << insideActive->second.file << ":"<< insideActive->second.line 
-                    << ": " << ptr << " is " << offset << " bytes inside a " 
-                    << insideActive->second.sz << " byte region allocated here" << std::endl;
+
+    // Save a copy of header
+    m61_header h_copy;
+    memcpy(&h_copy, p - HEAD_SZ, sizeof(m61_header));
+
+    // Check if header is valid
+    if (h_copy.magic != MAGIC || h_copy.self != (m61_header*)(p - HEAD_SZ)) {
+        fprintf(stderr, "MEMORY BUG: %s:%d: invalid free of pointer %p, not allocated\n",
+                file, line, ptr);
+
+        // Scan all buffers to find if pointer is inside another allocation
+        for (m61_memory_buffer* b = buffer_list; b; b = b->next) {
+            char* curr = b->buffer;
+            char* end = b->buffer + b->pos;
+            // Iterate through buffer
+            while (curr < end) {
+                m61_header* ch = (m61_header*)curr;
+                if (ch->magic != MAGIC || ch->size == 0) break; // Invalid header 
+                // If pointer is inside another allocation, report error
+                if (p > curr && p < curr + ch->size && ch->status == 1) {
+                    size_t offset = p - (curr + HEAD_SZ);
+                    fprintf(stderr, "  %s:%d: %p is %zu bytes inside a %zu byte region allocated here\n",
+                            ch->file, ch->line, ptr, offset, ch->user_size);
+                    abort();
+                }
+                curr += ch->size;
             }
         }
         abort();
     }
-    // Check trailing guard
-    const size_t activeSz = it->second.sz;
-    unsigned char* pUnsigned = reinterpret_cast<unsigned char*>(ptr);
-    for (size_t i = 0; i < guardSize; ++i) {
-        if (pUnsigned[activeSz + i] != guardExpression) {
-            std::cerr << "MEMORY BUG: " << file << ":" << line
-                << ": detected wild write during free of pointer " << ptr
-                << std::endl;
-            abort();
+
+    m61_header* h = (m61_header*)(p - HEAD_SZ);
+
+    // Check if already freed (double free)
+    if (h->status == 0) {
+        report_error(file, line, ptr, "double free");
+    }
+
+    // Check if footer is intact
+    m61_footer* f = (m61_footer*)((char*)h + h->size - FOOT_SZ);
+    if (f->size != h->size) {
+        report_wild_write(file, line, ptr);
+    }
+
+    // Check if padding is intact 
+    size_t padding_start = HEAD_SZ + h->user_size;
+    size_t padding_end = h->size - FOOT_SZ;
+    if (padding_end > padding_start) {
+        unsigned char* pad = (unsigned char*)h + padding_start;
+        size_t len = padding_end - padding_start;
+        for (size_t i = 0; i < len; ++i) {
+            if (pad[i] != 0xBD) report_wild_write(file, line, ptr);
         }
     }
-    // Handle successful case
+
+    // Update statistics
+    h->status = 0;
     --memory_stats.nactive;
-    memory_stats.active_size -= activeSz;
-    insertFreedAlloc({ p, align(activeSz + guardSize) });
-    trimmed.insert(it->first);
-    activeAlloc.erase(it);
+    memory_stats.active_size -= h->user_size;
+
+    // For large allocations, return buffer to OS
+    int order = order_for_size(h->size);
+    if (order > MAX_ORDER && buf->buffer == (char*)h) {
+        // Unlink from buffer list
+        if (buffer_list == buf) {
+            buffer_list = buf->next;
+        } else {
+            for (m61_memory_buffer* prev = buffer_list; prev; prev = prev->next) {
+                if (prev->next == buf) {
+                    prev->next = buf->next;
+                    break;
+                }
+            }
+        }
+        // Return buffer to OS
+        delete buf;
+        return;
+    }
+
+    size_t size = h->size;
+    char* base = buf->buffer;
+    // Try to coalesce with buddies
+    while (order < MAX_ORDER) {
+        // Since offset is aligned, we find buddy offset by XORing offset with size
+        // XOR with size flips the bit at position log2(size) to find the adjacent buddy
+        size_t offset = (char*)h - base;
+        size_t buddy_offset = offset ^ size;
+        m61_header* buddy = (m61_header*)(base + buddy_offset);
+
+        // If buddy is free, coalesce
+        if (buddy->magic == MAGIC && buddy->status == 0 && buddy->size == size) { // Buddy must be valid/free
+            free_list_remove((m61_freenode*)((char*)buddy + HEAD_SZ), order); // Remove buddy from free list 
+            if (buddy < h) h = buddy; // Choose lower address as new header
+            size <<= 1;
+            ++order;
+            write_boundary_tags(h, size, 0, 0, "?", 0); // Update header
+        } else {
+            break;
+        }
+    }
+
+    // Add to free list
+    write_boundary_tags(h, size, 0, 0, "?", 0);
+    free_list_insert((m61_freenode*)((char*)h + HEAD_SZ), order);
 }
 
 /// m61_calloc(count, sz, file, line)
@@ -304,12 +453,12 @@ void m61_free(void* ptr, const char* file, int line) {
 ///    also return `nullptr` if `count == 0` or `size == 0`.
 
 void* m61_calloc(size_t count, size_t sz, const char* file, int line) {
-    // Guard against multiplication overflow
+    // Check for overflow
     if (count != 0 && sz > SIZE_MAX / count) {
-        memory_stats.nfail++;
-        memory_stats.fail_size += static_cast<unsigned long long>(count) * static_cast<unsigned long long>(sz);
+        record_fail(count * sz);
         return nullptr;
     }
+    // Allocate memory
     void* ptr = m61_malloc(count * sz, file, line);
     if (ptr) {
         memset(ptr, 0, count * sz);
@@ -317,6 +466,60 @@ void* m61_calloc(size_t count, size_t sz, const char* file, int line) {
     return ptr;
 }
 
+/// m61_realloc(ptr, sz, file, line)
+///    Changes the size of the dynamic allocation pointed to by `ptr`
+///    to hold at least `sz` bytes. If the existing allocation cannot be
+///    enlarged, this function makes a new allocation, copies as much data
+///    as possible from the old allocation to the new, and returns a pointer
+///    to the new allocation. If `ptr` is `nullptr`, behaves like
+///    `m61_malloc(sz, file, line). `sz` must not be 0. If a required
+///    allocation fails, returns `nullptr` without freeing the original
+///    block.
+
+void* m61_realloc(void* ptr, size_t sz, const char* file, int line) {
+    if (!ptr) return m61_malloc(sz, file, line); // Handle nullptr case
+    if (sz == 0) { // If new size is zero, free and return nullptr
+        m61_free(ptr, file, line);
+        return nullptr;
+    }
+
+    // If pointer is invalid (not in heap or before header)
+    char* p = (char*)ptr;
+    m61_memory_buffer* buf = find_buffer(ptr);
+    if (!buf || p < buf->buffer + HEAD_SZ) {
+        m61_free(ptr, file, line);  // Let m61_free handle error reporting
+        return nullptr;
+    }
+
+    // If header is corrupted or block is already freed
+    m61_header h_copy;
+    memcpy(&h_copy, p - HEAD_SZ, sizeof(m61_header));
+    if (h_copy.magic != MAGIC || h_copy.self != (m61_header*)(p - HEAD_SZ) ||
+        h_copy.status != 1) {
+        m61_free(ptr, file, line);  // Let m61_free handle error reporting
+        return nullptr;
+    }
+
+    // Get old size
+    m61_header* h = (m61_header*)(p - HEAD_SZ);
+    size_t old_size = h->user_size;
+
+    // If new size is smaller or equal to old size: shrink in place
+    if (sz <= old_size) {
+        h->user_size = sz;
+        memory_stats.active_size -= (old_size - sz);
+        fill_padding(h, sz);
+        return ptr;
+    }
+
+    // If new size is larger: allocate new, copy old to new, free old
+    void* new_ptr = m61_malloc(sz, file, line);
+    if (new_ptr) {
+        memcpy(new_ptr, ptr, old_size);
+        m61_free(ptr, file, line);
+    }
+    return new_ptr;
+}
 
 /// m61_get_statistics()
 ///    Return the current memory statistics.
@@ -324,7 +527,6 @@ void* m61_calloc(size_t count, size_t sz, const char* file, int line) {
 m61_statistics m61_get_statistics() {
     return memory_stats;
 }
-
 
 /// m61_print_statistics()
 ///    Prints the current memory statistics.
@@ -337,17 +539,25 @@ void m61_print_statistics() {
            stats.active_size, stats.total_size, stats.fail_size);
 }
 
-
 /// m61_print_leak_report()
 ///    Prints a report of all currently-active allocated blocks of dynamic
 ///    memory.
 
 void m61_print_leak_report() {
-    for (const auto& pair : activeAlloc) {
-        std::cout << "LEAK CHECK: " << pair.second.file << ":" 
-            << pair.second.line << ": allocated object " << pair.first
-            << " with size " << pair.second.sz << std::endl;
+    // Iterate through all buffers, checking for leaks in each
+    for (m61_memory_buffer* b = buffer_list; b; b = b->next) {
+        char* curr = b->buffer;
+        char* end = b->buffer + b->pos;
+
+        // Check for leaks
+        while (curr < end) {
+            m61_header* h = (m61_header*)curr;
+            if (h->size == 0) break; // Avoid infinite loops/corrupted buffer errors
+            if (h->status == 1) { //If block is active
+                printf("LEAK CHECK: %s:%d: allocated object %p with size %zu\n",
+                       h->file, h->line, curr + HEAD_SZ, h->user_size);
+            }
+            curr += h->size;
+        }
     }
 }
-
-
