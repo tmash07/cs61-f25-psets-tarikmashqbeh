@@ -31,6 +31,9 @@ struct conditional_parser;
 struct pipeline_parser;
 struct command_parser;
 
+// CUSTOM FUNCTIONS FORWARD DECLARATIONS
+static void run_line(command_line_parser clp);
+
 
 // shell_parser
 //    A `shell_parser` object navigates a command line according to the

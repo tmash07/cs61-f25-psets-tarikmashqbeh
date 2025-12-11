@@ -1,4 +1,5 @@
 #include "sh61.hh"
+#include <cctype>
 #include <cstring>
 #include <cerrno>
 #include <vector>
@@ -9,22 +10,90 @@
 #undef exit
 #define exit __DO_NOT_CALL_EXIT__READ_PROBLEM_SET_DESCRIPTION__
 
+// Stores the last foreground command's exit status for $ expansion
+static int last_exit_status = 0;
+// Flag for SIGINT handling
+static volatile sig_atomic_t sigint_received = 0;
+// Signal handler for SIGINT (sets flag)
+static void sigint_handler(int) {
+    sigint_received = 1;
+}
+// Flag to track if program is running in a background child process
+static bool is_background_child = false;
+
+/// expand_variables(s)
+///     Expands shell variables in a string s.
+///     Supports ${VAR}, $VAR, $?, $$
+static std::string expand_variables(const std::string& s) {
+    std::string result;
+    size_t i = 0;
+    // Iterate through string characters
+    while (i < s.size()) {
+        if (s[i] == '$' && i + 1 < s.size()) { // If variable reference found
+            ++i;
+            std::string varname;
+
+            if (s[i] == '{') { // Check for ${VAR} syntax
+                ++i;
+                // Extract variable name
+                while (i < s.size() && s[i] != '}') {
+                    varname += s[i++];
+                }
+                // Check for and skip closing brace
+                if (i < s.size() && s[i] == '}') {
+                    ++i; 
+                }
+            }
+            // Check for special single-characters
+            else if (s[i] == '?') {
+                // $? returns last exit status
+                result += std::to_string(last_exit_status);
+                ++i;
+                continue;
+            }
+            else if (s[i] == '$') {
+                // $$ returns shell PID
+                result += std::to_string(getpid());
+                ++i;
+                continue;
+            }
+            else { // Check for regular $VAR
+                while (i < s.size() && (isalnum(s[i]) || s[i] == '_')) { // only alphanumeric and _ valid
+                    varname += s[i++];
+                }
+            }
+            // Find variable value 
+            if (!varname.empty()) {
+                const char* value = getenv(varname.c_str());
+                if (value) { // If variable has value
+                    result += value;
+                }
+            }
+        } else { // If not variable reference, copy character
+            result += s[i++];
+        }
+    }
+    
+    return result;
+}
 
 struct redirection {
     int fd;               
     std::string filename;
-    bool is_input;
+    bool is_input;        // true for < redirections
+    bool append;          // true for >> redirections
 };
 
 struct command {
     std::vector<std::string> args;
     std::vector<redirection> redirs;
+    std::string subshell_content;  // If non-empty, this is a subshell
     pid_t pid = -1;
 
     command();
     ~command();
 
-    void run(int stdin_fd = -1, int stdout_fd = -1);
+    void run(int stdin_fd = -1, int stdout_fd = -1, pid_t pgid = 0);
 };
 
 // command::command()
@@ -40,15 +109,18 @@ command::command() {
 command::~command() {
 }
 
-
-// COMMAND EXECUTION
-
-// Helper command that applies file redirections in a child process before commands run
+// Helper command to apply redirections before running a command
 static void apply_redirections(const std::vector<redirection>& redirs) {
     for (auto const& r : redirs) {
-        // Open a file that is read-only for input and write-only for output
-        // O_CREAT and O_TRUNC ensure file exists and is empty
-        int flags = r.is_input ? O_RDONLY : (O_WRONLY | O_CREAT | O_TRUNC);
+        // Determine open flags based on redirection type
+        int flags;
+        if (r.is_input) { // If input redirection
+            flags = O_RDONLY;
+        } else if (r.append) { // If append redirection
+            flags = O_WRONLY | O_CREAT | O_APPEND;
+        } else { // If output redirection
+            flags = O_WRONLY | O_CREAT | O_TRUNC;
+        }
         int fd = open(r.filename.c_str(), flags, 0666);
         
         // Handle error from making file
@@ -57,8 +129,8 @@ static void apply_redirections(const std::vector<redirection>& redirs) {
             _exit(1);
         }
         
-        // Point r.fd to the newly opened file
-        if (dup2(fd, r.fd) < 0) {
+        // Point file descriptor to the newly opened file
+        if (dup2(fd, r.fd) < 0) { // Handle error 
             perror("dup2");
             close(fd);
             _exit(1);
@@ -91,45 +163,56 @@ static void apply_redirections(const std::vector<redirection>& redirs) {
 //       Draw pictures!
 //    PHASE 7: Handle redirections.
 
-void command::run(int stdin_fd, int stdout_fd) {
+void command::run(int stdin_fd, int stdout_fd, pid_t pgid) {
     assert(this->pid == -1);
     
-    // Handle empty command
-    if (this->args.empty() && this->redirs.empty()) {
+    // Handle empty command (no args, no subshell, no redirections)
+    if (this->args.empty() && this->subshell_content.empty() && this->redirs.empty()) {
         this->pid = 0; 
         return;
     }
 
-    // Build argv
+    // Build argv for regular commands
     std::vector<char*> argv;
-    argv.reserve(this->args.size() + 1);
-    for (auto& s : this->args) {
-        argv.push_back(const_cast<char*>(s.c_str()));
+    if (!this->subshell_content.empty()) {
+        // Subshells (run_line) don't require argv
+    } else {
+        // Push regular command args to argv
+        argv.reserve(this->args.size() + 1);
+        for (auto& s : this->args) {
+            argv.push_back(const_cast<char*>(s.c_str()));
+        }
+        argv.push_back(nullptr);
     }
-    argv.push_back(nullptr);
 
     pid_t p = fork();
-    // Handle fork error
-    if (p < 0) {
+
+    if (p < 0) { // Handle fork error
         perror("fork");
         _exit(EXIT_FAILURE);
     } else if (p == 0) {
+        // Child process
+
+        // Set up process group for interrupt handling
+        // If group already exists, will join the existing group
+        setpgid(0, pgid);
+        
         // Set up pipeline connections
-        if (stdin_fd >= 0) {
+        if (stdin_fd >= 0) { // copy old stdin to new stdin
             if (dup2(stdin_fd, STDIN_FILENO) < 0) {
                 perror("dup2");
                 _exit(1);
             }
             close(stdin_fd);
         }
-        if (stdout_fd >= 0) {
+        if (stdout_fd >= 0) { // copy old stdout to new stdout
             if (dup2(stdout_fd, STDOUT_FILENO) < 0) {
                 perror("dup2");
                 _exit(1);
             }
             close(stdout_fd);
         }
-        // Ensure all other pipe file descriptors are closed (1024 is normal limit for open fd)
+        // Ensure all other pipe file descriptors are closed
         for (int fd = 3; fd < 1024; ++fd) {
             close(fd);  
         }
@@ -137,7 +220,13 @@ void command::run(int stdin_fd, int stdout_fd) {
         // Apply redirections
         apply_redirections(this->redirs);
 
-        // Run the command
+        if (!this->subshell_content.empty()) { // If this is a subshell
+            // Execute the subshell content as a command line
+            run_line(command_line_parser{this->subshell_content.c_str()});
+            _exit(last_exit_status);
+        }
+        
+        // Otherwise, run the regular command
         if (argv[0] != nullptr) {
             execvp(argv[0], argv.data());
             perror(argv[0]);
@@ -146,46 +235,112 @@ void command::run(int stdin_fd, int stdout_fd) {
             _exit(0);
         }
     }
+    
+    // Parent process
+
+    // Set child's process group from parent
+    // Avoids race condition (parent might run before child after fork)
+    setpgid(p, pgid == 0 ? p : pgid);
+    
     // Save child pid
     this->pid = p;
 }
 
-// Helper function to parse redirections from command line input
-static void parse_redirs(command_parser cmdp, std::vector<std::string>& args, std::vector<redirection>& redirs) {
-    args.clear(); 
-    redirs.clear();
+// Helper function to parse a command (supports commands, subshells, and redirs) from command line input
+static void parse_command(command_parser cmdp, command& cmd) {
+    cmd.args.clear();
+    cmd.redirs.clear();
+    cmd.subshell_content.clear();
 
+    // Track state for redirection parsing
     bool expect_filename = false;
     int pending_fd = -1;
-
-    for (auto tok = cmdp.token_begin(); tok != cmdp.end(); ++tok) {
+    bool pending_is_input = false;
+    bool pending_append = false;
+    
+    // Prepare to iterate through tokens
+    auto tok = cmdp.token_begin();
+    
+    if (tok != cmdp.end() && tok.type() == TYPE_LPAREN) { // If this is a subshell
+        ++tok;  // Skip the (
+        
+        // Track subshell depth
+        int paren_depth = 1;
+        
+        // Iterate through tokens, collecting subshell content
+        std::string subshell_str;
+        while (tok != cmdp.end() && paren_depth > 0) {
+            if (tok.type() == TYPE_LPAREN) { // Handle ( 
+                paren_depth++;
+                subshell_str += "( ";
+            } else if (tok.type() == TYPE_RPAREN) { // Handle )
+                paren_depth--;
+                if (paren_depth > 0) {
+                    subshell_str += ") ";
+                }
+            } else { // Add normal tokens to subshell content
+                subshell_str += tok.str() + " ";
+            }
+            ++tok;
+        }
+        
+        // Save subshell content
+        cmd.subshell_content = subshell_str;
+    }
+    
+    // Parse remaining tokens (redirections after subshell or commands)
+    for (; tok != cmdp.end(); ++tok) { // Continue iterating through tokens
         int t = tok.type();
 
-        // If token is a filename
-        if (expect_filename) {
+        // Handle different token types
+        if (expect_filename) { // If token is a filename following a redirect operator
             if (t == TYPE_NORMAL) {
+                // Create redirection object and add to list of redirections
                 redirection r;
                 r.fd = pending_fd;
-                r.filename = tok.str();
-                r.is_input = (pending_fd == STDIN_FILENO);
-                redirs.push_back(r);
+                r.filename = expand_variables(tok.str());
+                r.is_input = pending_is_input;
+                r.append = pending_append;
+                cmd.redirs.push_back(r);
                 expect_filename = false;
                 continue;
             }
-        }
-        // If token is a redirector 
-        if (t == TYPE_REDIRECT_OP) {
+        } 
+        if (t == TYPE_REDIRECT_OP) { // If token is a redirector
+            // Get redirect operator string
             std::string op = tok.str();
-            if (op == "<") {
-                pending_fd = STDIN_FILENO;
-            } else if (op == ">") {
-                pending_fd = STDOUT_FILENO;
-            } else if (op == "2>") {
-                pending_fd = STDERR_FILENO;
+            
+            // Parse leading file descriptor number (N in N>)
+            size_t i = 0;
+            int fd = -1;
+            while (i < op.size() && isdigit(op[i])) {
+                if (fd < 0) fd = 0;
+                fd = fd * 10 + (op[i] - '0');
+                ++i;
             }
+            
+            // Parse the operator itself
+            bool is_input = false;
+            bool append = false;
+            if (i < op.size() && op[i] == '<') { // If operator is <
+                is_input = true;
+                if (fd < 0) fd = STDIN_FILENO;  // default fd for <
+            } else if (i < op.size() && op[i] == '>') { // If operator is >
+                is_input = false;
+                if (fd < 0) fd = STDOUT_FILENO;  // default fd for >
+                // Check for >> (append)
+                if (i + 1 < op.size() && op[i + 1] == '>') {
+                    append = true;
+                }
+            }
+            
+            pending_fd = fd;
+            pending_is_input = is_input;
+            pending_append = append;
             expect_filename = true;
-        } else if (t == TYPE_NORMAL) { // If token is a command
-            args.push_back(tok.str());
+        } else if (t == TYPE_NORMAL && cmd.subshell_content.empty()) {
+            // Regular command argument added to args vector
+            cmd.args.push_back(expand_variables(tok.str()));
         }
     }
 }
@@ -206,11 +361,12 @@ static void restore_fds(int saved[3]) {
 }
 
 static int run_pipeline(pipeline_parser pp) {
-    // Parse commands from the input (redirections and arguments)
+    // Parse commands from the input (redirections, arguments, and subshells)
     std::vector<command> commands;
+    // Iterate through commands, parsing each
     for (auto cmdp = pp.command_begin(); cmdp; ++cmdp) {
         command cmd;
-        parse_redirs(cmdp, cmd.args, cmd.redirs);
+        parse_command(cmdp, cmd);
         commands.push_back(cmd);
     }
 
@@ -235,8 +391,18 @@ static int run_pipeline(pipeline_parser pp) {
         int saved[3] = {-1, -1, -1};
         // Apply redirections
         for (auto const& r : cmd.redirs) {
-            // Open the file for redirection
-            int fd = open(r.filename.c_str(), r.is_input ? O_RDONLY : (O_WRONLY | O_CREAT | O_TRUNC), 0666);
+            // Determine open flags based on redirection type
+            int flags;
+            if (r.is_input) { // If input redirection
+                flags = O_RDONLY;
+            } else if (r.append) { // If append redirection
+                flags = O_WRONLY | O_CREAT | O_APPEND;
+            } else { // If output redirection
+                flags = O_WRONLY | O_CREAT | O_TRUNC;
+            }
+            int fd = open(r.filename.c_str(), flags, 0666);
+            
+            // Handle error from making file
             if (fd < 0) {
                 perror(r.filename.c_str());
                 restore_fds(saved); 
@@ -244,25 +410,27 @@ static int run_pipeline(pipeline_parser pp) {
             }
             // Save original fds
             if (r.fd <= 2 && saved[r.fd] < 0) saved[r.fd] = dup(r.fd);
-            if (dup2(fd, r.fd) < 0) {
+            if (dup2(fd, r.fd) < 0) { // Handle error
                 perror("dup2");
                 close(fd);
                 restore_fds(saved);
                 return make_status(1);
             }
+            // Close original file
             close(fd);
         }
         
         // Execute cd command
         int status = chdir(target) < 0 ? 1 : 0;
-        if (status) { perror("cd"); }
-        restore_fds(saved);
+        if (status) { perror("cd"); } // Handle error
+        restore_fds(saved); // Restore original file descriptors
         return make_status(status);
     }
 
     // Run pipeline
     std::vector<pid_t> pids;
     int prev_read_fd = -1;
+    pid_t pgid = 0;  // Process group ID for this pipeline
 
     for (size_t i = 0; i < commands.size(); ++i) {
         bool last = (i == commands.size() - 1);
@@ -275,9 +443,16 @@ static int run_pipeline(pipeline_parser pp) {
             break;
         }
 
-        // Run command
-        commands[i].run(prev_read_fd, last ? -1 : pipefd[1]);
+        // Run command with process group
+        // First command uses pgid=0 to create new group, rest join that group
+        commands[i].run(prev_read_fd, last ? -1 : pipefd[1], pgid);
         if (commands[i].pid <= 0) { continue; }  // Skip empty commands
+        
+        // First valid process defines the process group for the pipeline
+        if (pgid == 0) {
+            pgid = commands[i].pid;
+        }
+        
         // Track child pid 
         pids.push_back(commands[i].pid);
         // Clean up parent file descriptors
@@ -298,6 +473,12 @@ static int run_pipeline(pipeline_parser pp) {
         prev_read_fd = -1;
     }
 
+    // Set this pipeline as the foreground process group
+    // Control-C will send SIGINT to this pipeline, but only when it is the foreground process group
+    if (pgid > 0 && !is_background_child) {
+        claim_foreground(pgid);
+    }
+
     // Wait for all pipeline processes to finish
     int status = 0;
     for (size_t i = 0; i < pids.size(); ++i) {
@@ -305,6 +486,12 @@ static int run_pipeline(pipeline_parser pp) {
         while (waitpid(pids[i], &s, 0) == -1 && errno == EINTR);
         if (i == pids.size() - 1){ status = s; } // Return last status
     }
+    
+    // Return foreground to the shell if we claimed it
+    if (!is_background_child) {
+        claim_foreground(0);
+    }
+    
     return status;
 }
 
@@ -315,13 +502,18 @@ static int run_conditional(conditional_parser cp) {
     int prev_op = TYPE_SEQUENCE;
 
     for (auto pp = cp.pipeline_begin(); pp; ++pp) {
+        // If SIGINT received, cancel the rest of the conditional
+        if (sigint_received) {
+            break;
+        }
+        
         bool should_run;
 
         if (!have_status) {
             // Always run first pipeline
             should_run = true;
         } else if (prev_op == TYPE_AND) {
-            // Run only if previous succeeded 
+            // Run only if previous succeeded
             bool prev_ok = (WIFEXITED(status) && WEXITSTATUS(status) == 0);
             should_run = prev_ok;
         } else if (prev_op == TYPE_OR) {
@@ -333,6 +525,16 @@ static int run_conditional(conditional_parser cp) {
         if (should_run) {
             status = run_pipeline(pp);
             have_status = true;
+            
+            // If child was killed by signal, treat as failure and check if we should stop
+            if (WIFSIGNALED(status) && WTERMSIG(status) == SIGINT) {
+                sigint_received = 1; // Set flag
+                break; // Cancel rest of conditional
+            }          
+            // Also check if shell received SIGINT
+            if (sigint_received) {
+                break;
+            }
         }
 
         // Check next operator
@@ -380,7 +582,13 @@ void run_line(command_line_parser clp) {
 
         if (!background) {
             // Foreground (run in this shell)
-            run_conditional(cp);
+            int status = run_conditional(cp);
+            // Update last_exit_status for $? variable expansion
+            if (WIFEXITED(status)) {
+                last_exit_status = WEXITSTATUS(status);
+            } else {
+                last_exit_status = 1; // Handle abnormal exit
+            }
         } else {
             // Background (fork new process to run this)
             pid_t pid = fork();
@@ -389,6 +597,8 @@ void run_line(command_line_parser clp) {
                 perror("fork");
                 run_conditional(cp);
             } else if (pid == 0) {
+                // Mark that we're in a background child process
+                is_background_child = true;
                 // Run the conditional in the child
                 int status = run_conditional(cp);
                 if (WIFEXITED(status)) {
@@ -425,6 +635,9 @@ int main(int argc, char* argv[]) {
     //   into the foreground
     claim_foreground(0);
     set_signal_handler(SIGTTOU, SIG_IGN);
+    
+    // Setup signal handler for SIGINT
+    set_signal_handler(SIGINT, sigint_handler);
 
     char buf[BUFSIZ];
     int bufpos = 0;
@@ -455,9 +668,22 @@ int main(int argc, char* argv[]) {
         // If a complete command line has been provided, run it
         bufpos = strlen(buf);
         if (bufpos == BUFSIZ - 1 || (bufpos > 0 && buf[bufpos - 1] == '\n')) {
+            // Reset interrupt flag before running new command line
+            sigint_received = 0;
             run_line(command_line_parser{buf});
             bufpos = 0;
             needprompt = 1;
+        }
+        
+        // Handle SIGINT (reset buffer and show new prompt)
+        if (sigint_received) {
+            sigint_received = 0;
+            bufpos = 0;
+            buf[0] = '\0';
+            needprompt = true;
+            if (!quiet) {
+                printf("\n");
+            }
         }
         // Handle zombie processes
         int status;

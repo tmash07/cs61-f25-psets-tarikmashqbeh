@@ -12,3 +12,7 @@ Grading notes (if any)
 
 Extra credit attempted (if any)
 -------------------------------
+Interruption
+Complex Redirections (N<, N>, N>>, >>)
+Subshells
+Variable Substitution (${VAR}, $VAR, $$, $?)
